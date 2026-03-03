@@ -187,7 +187,36 @@ class ViolationsDetector:
         Args:
             frame: Input frame
             detections: List of violation detections
--            cv2.putText(frame, label, (x1, y1 - 4), 
+            
+        Returns:
+            Frame with drawn violations
+        """
+        for detection in detections:
+            bbox = detection['bbox']
+            x1, y1, x2, y2 = bbox
+            class_name = detection['class']
+            confidence = detection['confidence']
+            
+            # Color based on violation type
+            if class_name == 'nohelmet':
+                color = (0, 0, 255)  # Red for no helmet violation
+                label = f"No Helmet {confidence:.2f}"
+            elif class_name == 'novest':
+                color = (0, 165, 255)  # Orange for no vest violation
+                label = f"No Vest {confidence:.2f}"
+            else:
+                continue  # Skip unknown classes
+            
+            # Draw bounding box
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            
+            # Draw label background - optimized
+            label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 2)[0]  # Reduced font size
+            cv2.rectangle(frame, (x1, y1 - label_size[1] - 8), 
+                         (x1 + label_size[0], y1), color, -1)
+            
+            # Draw label text
+            cv2.putText(frame, label, (x1, y1 - 4), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)  # Thinner text
         
         return frame

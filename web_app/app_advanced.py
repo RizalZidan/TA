@@ -17,6 +17,16 @@ import time
 import base64
 import json
 
+# Suppress OpenCV warnings untuk RTSP timeout (warning tidak berbahaya, hanya info)
+# Warning ini muncul karena FFmpeg menggunakan timeout 30s di level C++
+# Tapi kita sudah handle timeout di level Python dengan thread timeout
+try:
+    # Try to set OpenCV log level (if available in this version)
+    cv2.setLogLevel(1)  # 0=Silent, 1=Error, 2=Warn, 3=Info, 4=Debug
+except:
+    # If not available, try environment variable
+    os.environ['OPENCV_LOG_LEVEL'] = 'ERROR'
+
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from src.violations_detector import ViolationsDetector
 
@@ -91,81 +101,433 @@ global_stats = {
 tracked_persons = {}  # {camera_id: {person_id: {last_seen_time, violations}}}
 detection_cooldown = 1.0
 
+# Global state for frame sharing (Thread-safe)
+camera_frames = {}  # {camera_id: {'frame': frame, 'detections': [], 'timestamp': time.time()}}
+frame_lock = threading.Lock()
+
+# Diagnostic function untuk test RTSP dengan detail
+def diagnose_rtsp_connection(url, timeout_sec=8):
+    """Diagnose RTSP connection dengan informasi detail"""
+    import socket
+    from urllib.parse import urlparse
+    
+    results = {
+        'url': url,
+        'host': None,
+        'port': None,
+        'network_reachable': False,
+        'rtsp_port_open': False,
+        'connection_tests': [],
+        'recommendations': []
+    }
+    
+    try:
+        # Parse URL
+        parsed = urlparse(url)
+        host = parsed.hostname
+        port = parsed.port or 554  # Default RTSP port
+        
+        results['host'] = host
+        results['port'] = port
+        
+        # Test 1: Network connectivity (ping test via socket)
+        print(f"🔍 Testing network connectivity to {host}:{port}...")
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(3)
+            result = sock.connect_ex((host, port))
+            sock.close()
+            
+            if result == 0:
+                results['network_reachable'] = True
+                results['rtsp_port_open'] = True
+                print(f"✅ Network reachable: {host}:{port} is open")
+            else:
+                results['network_reachable'] = False
+                print(f"❌ Network unreachable: {host}:{port} is closed or filtered")
+                results['recommendations'].append(f"Check if camera IP {host} is accessible from this machine")
+                results['recommendations'].append(f"Check firewall rules for port {port}")
+        except Exception as e:
+            print(f"❌ Network test failed: {e}")
+            results['recommendations'].append(f"Network test error: {str(e)}")
+        
+        # Test 2: Try different RTSP URL formats
+        print(f"🔍 Testing different RTSP URL formats...")
+        test_urls = []
+        
+        # Original URL
+        test_urls.append(('Original', url))
+        
+        # Try with different paths
+        base_url = f"{parsed.scheme}://"
+        if parsed.username and parsed.password:
+            base_url += f"{parsed.username}:{parsed.password}@"
+        base_url += f"{host}"
+        if port != 554:
+            base_url += f":{port}"
+        
+        # Common RTSP paths
+        common_paths = [
+            '/live.sdp',
+            '/live',
+            '/stream',
+            '/cam',
+            '/camera1',
+            '/media',
+            '/video',
+            '/h264',
+            '/main',
+            '/sub'
+        ]
+        
+        for path in common_paths:
+            if path not in url:
+                test_urls.append((f'Path: {path}', base_url + path))
+        
+        # Try with transport options
+        if '?' not in url:
+            test_urls.append(('TCP Transport', url + '?transport=tcp'))
+            test_urls.append(('UDP Transport', url + '?transport=udp'))
+        
+        # Test each URL
+        for test_name, test_url in test_urls[:10]:  # Limit to 10 tests
+            print(f"📡 Testing: {test_name} - {test_url}")
+            test_result = test_rtsp_connection(test_url, timeout_sec=timeout_sec)
+            
+            results['connection_tests'].append({
+                'name': test_name,
+                'url': test_url,
+                'success': test_result['success'],
+                'error': test_result['error']
+            })
+            
+            if test_result['success']:
+                print(f"✅ SUCCESS with {test_name}!")
+                results['recommendations'].append(f"✅ Use this URL: {test_url}")
+                if test_result['cap']:
+                    test_result['cap'].release()
+                break
+            else:
+                print(f"❌ Failed: {test_result['error']}")
+        
+        # Generate recommendations
+        if not any(t['success'] for t in results['connection_tests']):
+            results['recommendations'].append("❌ All RTSP connection attempts failed")
+            results['recommendations'].append("💡 Try testing the URL in VLC player first")
+            results['recommendations'].append("💡 Verify camera credentials and IP address")
+            results['recommendations'].append("💡 Check if camera supports RTSP protocol")
+            if not results['network_reachable']:
+                results['recommendations'].append("⚠️ Network connectivity issue detected - fix this first")
+        
+    except Exception as e:
+        print(f"❌ Diagnostic error: {e}")
+        results['recommendations'].append(f"Diagnostic error: {str(e)}")
+    
+    return results
+
+# Helper function untuk test RTSP connection dengan timeout (cross-platform)
+def test_rtsp_connection(url, timeout_sec=5):
+    """Test RTSP connection dengan timeout yang lebih pendek (menggunakan threading)"""
+    result = {'success': False, 'cap': None, 'error': None}
+    cap_container = {'cap': None}
+    cap_ref = {'cap': None}  # Reference untuk force release saat timeout
+    exception_container = {'exception': None}
+    stop_flag = threading.Event()
+    
+    def connect_rtsp():
+        """Function yang dijalankan di thread terpisah"""
+        cap = None
+        try:
+            # Buat VideoCapture dengan timeout yang lebih pendek
+            # Gunakan CAP_FFMPEG dengan opsi timeout
+            timeout_ms = timeout_sec * 1000
+            
+            # Coba set environment variable untuk FFmpeg (jika didukung)
+            # Note: Ini mungkin tidak bekerja di semua sistem, tapi tidak akan error
+            try:
+                os.environ['OPENCV_FFMPEG_READ_ATTEMPTS'] = '1'
+                os.environ['OPENCV_FFMPEG_READ_ATTEMPT_MSEC'] = str(timeout_ms)
+            except:
+                pass
+            
+            cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+            cap_ref['cap'] = cap  # Simpan reference untuk force release jika timeout
+            
+            # Set properties dengan timeout lebih pendek
+            cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, timeout_ms)
+            cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, timeout_ms)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            
+            # Check if opened dengan polling (lebih cepat detect)
+            start_check = time.time()
+            is_opened = False
+            max_check_time = timeout_sec * 0.8  # 80% dari timeout untuk check
+            
+            # Polling isOpened dengan interval pendek
+            while not stop_flag.is_set() and (time.time() - start_check) < max_check_time:
+                try:
+                    is_opened = cap.isOpened()
+                    if is_opened:
+                        break
+                except:
+                    pass
+                time.sleep(0.05)  # Check setiap 50ms untuk lebih responsif
+            
+            check_elapsed = time.time() - start_check
+            
+            if stop_flag.is_set():
+                if cap:
+                    try:
+                        cap.release()
+                    except:
+                        pass
+                cap_ref['cap'] = None
+                exception_container['exception'] = 'Cancelled by timeout'
+                return
+            
+            if not is_opened:
+                if cap:
+                    try:
+                        cap.release()
+                    except:
+                        pass
+                cap_ref['cap'] = None
+                exception_container['exception'] = f'Failed to open ({check_elapsed:.1f}s)'
+                return
+            
+            # Try read frame dengan timeout yang tersisa
+            remaining_time = timeout_sec - check_elapsed
+            if remaining_time < 0.5:
+                if cap:
+                    try:
+                        cap.release()
+                    except:
+                        pass
+                cap_ref['cap'] = None
+                exception_container['exception'] = 'Not enough time for read'
+                return
+            
+            start_time = time.time()
+            ret = False
+            frame = None
+            
+            # Try read dengan timeout check
+            while not stop_flag.is_set() and (time.time() - start_time) < remaining_time:
+                try:
+                    ret, frame = cap.read()
+                    if ret and frame is not None:
+                        break
+                except:
+                    pass
+                time.sleep(0.05)  # Check setiap 50ms
+            
+            read_elapsed = time.time() - start_time
+            
+            if stop_flag.is_set():
+                if cap:
+                    try:
+                        cap.release()
+                    except:
+                        pass
+                cap_ref['cap'] = None
+                exception_container['exception'] = 'Cancelled by timeout'
+                return
+            
+            if not ret or frame is None or frame.size == 0:
+                if cap:
+                    try:
+                        cap.release()
+                    except:
+                        pass
+                cap_ref['cap'] = None
+                exception_container['exception'] = f'No valid frame ({read_elapsed:.1f}s)'
+                return
+            
+            # Success!
+            cap_container['cap'] = cap
+            cap_ref['cap'] = None  # Clear reference karena sudah di container
+            cap = None  # Prevent release
+                
+        except Exception as e:
+            exception_container['exception'] = f'Exception: {str(e)}'
+        finally:
+            # Pastikan cap di-release jika tidak berhasil
+            if cap:
+                try:
+                    cap.release()
+                except:
+                    pass
+            # Clear reference
+            if cap_ref['cap'] == cap:
+                cap_ref['cap'] = None
+    
+    # Jalankan di thread terpisah dengan timeout
+    thread = threading.Thread(target=connect_rtsp, daemon=True)
+    thread.start()
+    thread.join(timeout=timeout_sec + 0.5)  # Beri sedikit extra time
+    
+    if thread.is_alive():
+        # Thread masih berjalan = timeout, set stop flag untuk cancel
+        stop_flag.set()
+        
+        # Force release VideoCapture jika masih ada (dari cap_ref atau cap_container)
+        # Ini penting untuk mencegah FFmpeg terus mencoba koneksi di background
+        if cap_ref['cap']:
+            try:
+                cap_ref['cap'].release()
+            except:
+                pass
+            cap_ref['cap'] = None
+        
+        if cap_container['cap']:
+            try:
+                cap_container['cap'].release()
+            except:
+                pass
+            cap_container['cap'] = None
+        
+        # Tunggu sebentar untuk thread selesai (non-blocking)
+        thread.join(timeout=0.3)
+        
+        # Note: Warning FFmpeg 30s mungkin masih muncul di log setelah ini
+        # Ini NORMAL dan tidak berbahaya - itu hanya info dari FFmpeg di level C++
+        # Yang penting: koneksi sudah di-cancel di level Python setelah 5s
+        # dan VideoCapture sudah di-release, jadi tidak ada resource leak
+        result['error'] = f'Connection timeout after {timeout_sec}s'
+        print(f"ℹ️  Note: FFmpeg warning (30s) may appear but connection already cancelled at {timeout_sec}s")
+        return result
+    
+    if exception_container['exception']:
+        result['error'] = exception_container['exception']
+        return result
+    
+    if cap_container['cap']:
+        result['success'] = True
+        result['cap'] = cap_container['cap']
+    else:
+        result['error'] = 'Unknown error'
+    
+    return result
+
 # Camera monitoring functions
 def start_camera_monitoring(camera_id, camera_source):
     """Start monitoring a specific camera with enhanced RTSP support"""
     global cameras, camera_threads, tracked_persons
     
+    # Normalize source string to avoid leading/trailing whitespace issues
+    if isinstance(camera_source, str):
+        camera_source = camera_source.strip()
+
     if camera_id in cameras:
         return False
     
     print(f"🎯 Starting camera {camera_id} with source: {camera_source}")
     
-    # Enhanced RTSP connection
+    # Enhanced RTSP connection dengan timeout lebih pendek
     if camera_source.startswith('rtsp://'):
-        # Try multiple RTSP connection methods
         cap = None
+        connection_timeout = 5  # 5 detik per method
         
         # Method 1: Direct connection
-        print(f"📡 Method 1: Direct RTSP connection...")
-        cap = cv2.VideoCapture(camera_source)
-        if cap.isOpened():
-            ret, frame = cap.read()
-            if ret:
-                print(f"✅ Direct RTSP connection successful!")
+        print(f"📡 Method 1: Direct RTSP connection (timeout: {connection_timeout}s)...")
+        result = test_rtsp_connection(camera_source, connection_timeout)
+        if result['success']:
+            print(f"✅ Direct RTSP connection successful!")
+            cap = result['cap']
+            cameras[camera_id] = cap
+        else:
+            print(f"❌ Direct RTSP failed: {result['error']}")
+        
+        # Method 2: TCP transport
+        if cap is None:
+            print(f"📡 Method 2: RTSP with TCP transport (timeout: {connection_timeout}s)...")
+            tcp_url = f"{camera_source}?transport=tcp"
+            result = test_rtsp_connection(tcp_url, connection_timeout)
+            if result['success']:
+                print(f"✅ TCP RTSP connection successful!")
+                cap = result['cap']
                 cameras[camera_id] = cap
             else:
-                cap.release()
-                cap = None
+                print(f"❌ TCP RTSP failed: {result['error']}")
         
-        # Method 2: With TCP transport
+        # Method 3: UDP transport
         if cap is None:
-            print(f"📡 Method 2: RTSP with TCP transport...")
-            tcp_url = f"{camera_source}?transport=tcp"
-            cap = cv2.VideoCapture(tcp_url)
-            if cap.isOpened():
-                ret, frame = cap.read()
-                if ret:
-                    print(f"✅ TCP RTSP connection successful!")
-                    cameras[camera_id] = cap
-                else:
-                    cap.release()
-                    cap = None
-        
-        # Method 3: With UDP transport
-        if cap is None:
-            print(f"📡 Method 3: RTSP with UDP transport...")
+            print(f"📡 Method 3: RTSP with UDP transport (timeout: {connection_timeout}s)...")
             udp_url = f"{camera_source}?transport=udp"
-            cap = cv2.VideoCapture(udp_url)
-            if cap.isOpened():
-                ret, frame = cap.read()
-                if ret:
-                    print(f"✅ UDP RTSP connection successful!")
-                    cameras[camera_id] = cap
-                else:
-                    cap.release()
-                    cap = None
+            result = test_rtsp_connection(udp_url, connection_timeout)
+            if result['success']:
+                print(f"✅ UDP RTSP connection successful!")
+                cap = result['cap']
+                cameras[camera_id] = cap
+            else:
+                print(f"❌ UDP RTSP failed: {result['error']}")
         
-        # Method 4: With extended timeout
-        if cap is None:
-            print(f"📡 Method 4: RTSP with extended timeout...")
-            cap = cv2.VideoCapture(camera_source)
-            if cap.isOpened():
-                # Set extended timeout
-                cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 30000)
-                cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 30000)
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                
-                ret, frame = cap.read()
-                if ret:
-                    print(f"✅ Extended timeout RTSP connection successful!")
-                    cameras[camera_id] = cap
-                else:
-                    cap.release()
-                    cap = None
+        # Method 4: Alternative paths (hanya jika URL mengandung /live)
+        if cap is None and '/live' in camera_source:
+            print(f"📡 Method 4: Trying alternative RTSP paths (timeout: {connection_timeout}s)...")
+            alternatives = [
+                camera_source.replace('/live', '/stream'),
+                camera_source.replace('/live', '/camera1'),
+                camera_source.replace('/live', '/media'),
+            ]
+            
+            for alt_url in alternatives:
+                if alt_url != camera_source:
+                    print(f"📡 Trying: {alt_url}")
+                    result = test_rtsp_connection(alt_url, connection_timeout)
+                    if result['success']:
+                        print(f"✅ Alternative RTSP connection successful: {alt_url}")
+                        cap = result['cap']
+                        cameras[camera_id] = cap
+                        break
+                    else:
+                        print(f"❌ Failed: {result['error']}")
         
         if cap is None:
-            print(f"❌ All RTSP connection methods failed for {camera_source}")
+            print(f"\n❌ All RTSP connection methods failed for {camera_source}")
+            print(f"\n🔍 Running diagnostic to identify the issue...")
+            print(f"{'='*60}")
+            
+            # Run diagnostic untuk mengetahui masalahnya
+            diagnostic = diagnose_rtsp_connection(camera_source, timeout_sec=6)
+            
+            print(f"\n{'='*60}")
+            print(f"📊 DIAGNOSTIC SUMMARY:")
+            print(f"{'='*60}")
+            print(f"Network Reachable: {'✅ YES' if diagnostic['network_reachable'] else '❌ NO'}")
+            print(f"RTSP Port Open: {'✅ YES' if diagnostic['rtsp_port_open'] else '❌ NO'}")
+            
+            if diagnostic['network_reachable'] and not diagnostic['rtsp_port_open']:
+                print(f"\n⚠️  ISSUE IDENTIFIED: Network reachable but RTSP port is closed/filtered")
+                print(f"   → This suggests a firewall or port blocking issue")
+                print(f"   → The RTSP URL might be correct, but port {diagnostic.get('port', 554)} is blocked")
+            elif not diagnostic['network_reachable']:
+                print(f"\n⚠️  ISSUE IDENTIFIED: Network connectivity problem")
+                print(f"   → Camera IP is not reachable from this machine")
+                print(f"   → Check network configuration, VPN, or firewall rules")
+            else:
+                print(f"\n⚠️  ISSUE IDENTIFIED: RTSP URL or authentication problem")
+                print(f"   → Network is OK, but RTSP connection failed")
+                print(f"   → Check RTSP URL format, username/password, or camera settings")
+            
+            # Show recommendations
+            if diagnostic.get('recommendations'):
+                print(f"\n💡 RECOMMENDATIONS:")
+                for rec in diagnostic['recommendations'][:5]:  # Show top 5
+                    print(f"   {rec}")
+            
+            # Check if any test was successful
+            successful_test = None
+            for test in diagnostic.get('connection_tests', []):
+                if test.get('success'):
+                    successful_test = test
+                    break
+            
+            if successful_test:
+                print(f"\n✅ FOUND WORKING URL: {successful_test['url']}")
+                print(f"   Try using this URL instead!")
+            
+            print(f"{'='*60}\n")
             return False
             
     else:
@@ -231,14 +593,45 @@ def monitor_camera(camera_id, cap):
     
     frame_count = 0
     start_time = time.time()
+    consecutive_failures = 0
+    max_failures = 10
     
     while camera_id in cameras and cameras[camera_id].isOpened():
+        # Add timeout check untuk read operation
+        read_start = time.time()
         ret, frame = cameras[camera_id].read()
+        read_elapsed = time.time() - read_start
+        
+        # Jika read terlalu lama (>2 detik), skip frame ini
+        if read_elapsed > 2.0:
+            print(f"⚠️ Camera {camera_id} read took {read_elapsed:.1f}s, skipping frame")
+            consecutive_failures += 1
+            if consecutive_failures >= max_failures:
+                print(f"❌ Camera {camera_id} too many slow reads, stopping monitoring")
+                break
+            time.sleep(0.1)
+            continue
+        
         if not ret:
-            break
+            consecutive_failures += 1
+            if consecutive_failures >= max_failures:
+                print(f"❌ Camera {camera_id} too many read failures, stopping monitoring")
+                break
+            time.sleep(0.1)
+            continue
+        
+        consecutive_failures = 0  # Reset on success
         
         frame_count += 1
         detections = detector.detect_violations(frame)
+        
+        # Update shared frame for video feed
+        with frame_lock:
+            camera_frames[camera_id] = {
+                'frame': frame.copy(),
+                'detections': detections,
+                'timestamp': time.time()
+            }
         
         # Process detections with person tracking
         current_time = time.time()
@@ -343,34 +736,49 @@ def generate_camera_feed(camera_id):
                b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
         return
     
-    # Stream frames if camera is available
-    frame_count = 0
-    start_time = time.time()
+    # Stream frames from shared state
+    last_frame_time = 0
     
-    while camera_id in cameras and cameras[camera_id].isOpened():
-        ret, frame = cameras[camera_id].read()
-        if ret:
-            frame_count += 1
-            
-            # Draw detections on frame
-            try:
-                detections = detector.detect_violations(frame)
-                frame_with_detections = detector.draw_violations(frame.copy(), detections)
-            except Exception as e:
-                print(f"⚠️ Detection error: {e}")
-                frame_with_detections = frame.copy()
-            
-            # Encode frame (tanpa overlay info)
-            _, buffer = cv2.imencode('.jpg', frame_with_detections)
-            frame_bytes = buffer.tobytes()
-            
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-        else:
-            print(f"⚠️ Failed to read frame from camera {camera_id}")
-            break
+    while camera_id in cameras:
+        # Check if we have a frame for this camera
+        current_frame_data = None
         
-        time.sleep(0.033)  # ~30 FPS
+        with frame_lock:
+            if camera_id in camera_frames:
+                data = camera_frames[camera_id]
+                # Only process if it's a new frame
+                if data['timestamp'] > last_frame_time:
+                    current_frame_data = data
+                    last_frame_time = data['timestamp']
+        
+        if current_frame_data:
+            frame = current_frame_data['frame'].copy()
+            detections = current_frame_data['detections']
+            
+            # Draw detections on frame (using pre-computed detections)
+            try:
+                frame_with_detections = detector.draw_violations(frame, detections)
+            except Exception as e:
+                # print(f"⚠️ Draw error: {e}")
+                frame_with_detections = frame
+            
+            # Encode frame
+            try:
+                _, buffer = cv2.imencode('.jpg', frame_with_detections)
+                frame_bytes = buffer.tobytes()
+                
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+            except Exception as e:
+                print(f"⚠️ Encode error: {e}")
+                
+        else:
+            # No new frame yet, wait a bit
+            time.sleep(0.01)
+            continue
+            
+        # Control FPS of the stream slightly
+        time.sleep(0.03)  # ~30 FPS cap for the stream
     
     # Generate placeholder frame
     import numpy as np
@@ -619,11 +1027,14 @@ DASHBOARD_TEMPLATE = """
             display: flex;
             align-items: center;
             gap: 20px;
+            flex-wrap: wrap;
         }
         .header-camera-form {
             display: flex;
             align-items: center;
             gap: 8px;
+            flex-wrap: wrap;
+            max-width: 800px;
         }
         .header-camera-form input,
         .header-camera-form select {
@@ -633,16 +1044,19 @@ DASHBOARD_TEMPLATE = """
             border: 1px solid #333;
             background: #000;
             color: #fff;
+            min-width: 120px;
         }
         .header-camera-form button {
             padding: 6px 10px;
             font-size: 11px;
             border-radius: 3px;
+            min-width: 60px;
         }
         .header-camera-extra {
             display: flex;
             align-items: center;
             gap: 6px;
+            flex-wrap: wrap;
         }
         .user-info {
             display: flex;
@@ -673,7 +1087,7 @@ DASHBOARD_TEMPLATE = """
             min-height: calc(100vh - 70px);
         }
         .sidebar {
-            width: 220px;
+            width: 140px; /* reduce from 220px */
             background: #111;
             border-right: 2px solid #333;
             padding-top: 10px;
@@ -684,14 +1098,15 @@ DASHBOARD_TEMPLATE = """
             gap: 5px;
         }
         .nav-tab {
-            padding: 12px 20px;
+            padding: 10px 12px; /* reduce padding */
             cursor: pointer;
             border-left: 3px solid transparent;
             color: #888;
             font-weight: 700;
             text-transform: uppercase;
-            letter-spacing: 1px;
+            letter-spacing: 0.5px; /* reduce letter spacing */
             transition: all 0.3s ease;
+            font-size: 12px; /* smaller font */
         }
         .nav-tab.active {
             color: #fff;
@@ -704,18 +1119,23 @@ DASHBOARD_TEMPLATE = """
         }
         .content-area {
             flex: 1;
+            background: #000;
+            min-height: calc(100vh - 120px); /* Ensure minimum height */
         }
         
         /* Container */
         .container { 
-            max-width: 1400px; 
+            max-width: 100%; /* use full available width */
             margin: 0 auto; 
-            padding: 20px;
+            padding: 10px 15px; /* reduce padding */
+            background: #000;
+            min-height: calc(100vh - 120px); /* Ensure minimum height */
         }
         
         /* Tab Content */
         .tab-content {
             display: none;
+            min-height: 400px; /* Ensure minimum height */
         }
         .tab-content.active {
             display: block;
@@ -724,16 +1144,54 @@ DASHBOARD_TEMPLATE = """
         /* Camera Grid */
         .camera-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
-            gap: 20px;
-            margin-bottom: 20px;
+            grid-template-columns: repeat(auto-fit, minmax(450px, 1fr));
+            gap: 25px;
+            margin-bottom: 30px;
+            align-items: start; /* Start from top, don't stretch */
+            padding: 10px;
+            min-height: 300px; /* Ensure minimum height so it's visible */
+            background: #000; /* Ensure background is visible */
         }
+        
+        /* Responsive Grid */
+        @media (max-width: 1400px) {
+            .camera-grid {
+                grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+                gap: 20px;
+                padding: 8px;
+            }
+        }
+        
+        @media (max-width: 1200px) {
+            .camera-grid {
+                grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+                gap: 18px;
+                padding: 6px;
+            }
+        }
+        
+        @media (max-width: 900px) {
+            .camera-grid {
+                grid-template-columns: repeat(2, 1fr);
+                gap: 15px;
+                padding: 5px;
+            }
+        }
+        
+        @media (max-width: 768px) {
+            .camera-grid {
+                grid-template-columns: 1fr;
+                gap: 15px;
+                padding: 5px;
+            }
+        }
+        
         .view-mode-bar {
             display: flex;
             align-items: center;
             justify-content: flex-end;
             gap: 10px;
-            margin-bottom: 10px;
+            margin-bottom: 15px;
             color: #888;
             font-size: 12px;
             text-transform: uppercase;
@@ -751,6 +1209,13 @@ DASHBOARD_TEMPLATE = """
             border: 2px solid #333;
             padding: 20px;
             position: relative;
+            display: flex;
+            flex-direction: column;
+            min-height: 0; /* Allow flex items to shrink */
+            box-sizing: border-box;
+            width: 100%;
+            max-width: 100%;
+            overflow: hidden;
         }
         .camera-card::before {
             content: '';
@@ -800,31 +1265,48 @@ DASHBOARD_TEMPLATE = """
             background: #000;
             border: 1px solid #333;
             overflow: hidden;
-            aspect-ratio: 16/9;
+            /* Consistent aspect ratio for all cards */
+            aspect-ratio: 16 / 9;
+            width: 100%;
+            min-height: 0; /* Allow flex shrink */
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
         }
         .video-feed {
             width: 100%;
             height: 100%;
             object-fit: cover;
+            display: block;
         }
         .camera-controls {
             display: flex;
             gap: 10px;
             margin-top: 15px;
+            flex: 0 0 auto;
+            align-items: stretch;
+            width: 100%;
+            box-sizing: border-box;
         }
         .control-btn {
-            flex: 1;
+            flex: 1; /* equal 1/4 width each */
             padding: 10px;
             border: 2px solid #fff;
             font-family: 'Courier New', monospace;
             font-size: 14px;
             font-weight: 700;
             cursor: pointer;
-            transition: all 0.3s ease;
+            transition: all 0.2s ease;
             text-transform: uppercase;
             letter-spacing: 1px;
             background: #000;
             color: #fff;
+            box-sizing: border-box;
+            text-align: center;
+            white-space: nowrap;
+            min-height: 40px;
+            overflow: hidden; /* clip button text if too long */
         }
         .control-btn.start {
             border-color: #ffffff;
@@ -845,26 +1327,116 @@ DASHBOARD_TEMPLATE = """
         .control-btn:hover {
             transform: translateY(-2px);
         }
+        /* reduce hover lift to avoid overlapping nearby cards */
+        .control-btn:active, .control-btn:focus {
+            transform: none;
+        }
         .camera-info {
             margin-top: 15px;
             padding: 10px;
             background: #000;
             border: 1px solid #333;
+            flex: 0 0 auto;
+            overflow: hidden;
+            width: 100%;
+            max-width: 100%; /* ensure info box doesn't overflow card */
+            box-sizing: border-box;
         }
         .info-text {
             color: #888;
-            font-size: 11px;
+            font-size: 10px; /* smaller font to fit more */
             font-family: 'Courier New', monospace;
             text-transform: uppercase;
-            letter-spacing: 1px;
-            margin-bottom: 5px;
+            letter-spacing: 0.5px; /* reduce letter spacing */
+            margin-bottom: 3px;
+            word-wrap: break-word; /* wrap long text */
+            overflow-wrap: break-word; /* modern wrap */
+            word-break: break-all; /* break very long words/urls */
+            width: 100%;
+            box-sizing: border-box;
         }
         .info-text:last-child {
             margin-bottom: 0;
         }
+        
+        /* Per-mode grid settings (heights handled by flex, not min-height) */
+        
+        /* Compact mode for 8 cameras */
+        .view-mode-8 .camera-grid {
+            gap: 12px;
+            padding: 8px;
+            grid-template-columns: repeat(4, 1fr) !important; /* Force 4 columns */
         }
-        .control-btn:hover {
-            opacity: 0.8;
+        .view-mode-8 .camera-card {
+            padding: 12px;
+        }
+        .view-mode-8 .camera-title {
+            font-size: 14px;
+        }
+        .view-mode-8 .status-text {
+            font-size: 10px;
+        }
+        .view-mode-8 .camera-header {
+            margin-bottom: 6px;
+        }
+        .view-mode-8 .camera-controls {
+            gap: 6px;
+            margin-top: 10px;
+        }
+        .view-mode-8 .control-btn {
+            padding: 6px 4px;
+            font-size: 10px;
+            letter-spacing: 0.5px;
+            min-height: 32px;
+        }
+        .view-mode-8 .camera-info {
+            margin-top: 10px;
+            padding: 6px;
+        }
+        .view-mode-8 .info-text {
+            font-size: 9px;
+            margin-bottom: 2px;
+        }
+        
+        /* Compact mode for 16 cameras */
+        .view-mode-16 .camera-grid {
+            gap: 8px;
+            padding: 6px;
+            grid-template-columns: repeat(4, 1fr) !important; /* Force 4 columns */
+        }
+        .view-mode-16 .camera-card {
+            padding: 8px;
+        }
+        .view-mode-16 .camera-title {
+            font-size: 12px;
+        }
+        .view-mode-16 .status-text {
+            font-size: 9px;
+        }
+        .view-mode-16 .status-dot {
+            width: 8px;
+            height: 8px;
+        }
+        .view-mode-16 .camera-header {
+            margin-bottom: 4px;
+        }
+        .view-mode-16 .camera-controls {
+            gap: 4px;
+            margin-top: 8px;
+        }
+        .view-mode-16 .control-btn {
+            padding: 4px 2px;
+            font-size: 9px;
+            letter-spacing: 0px;
+            min-height: 28px;
+        }
+        .view-mode-16 .camera-info {
+            margin-top: 8px;
+            padding: 4px;
+        }
+        .view-mode-16 .info-text {
+            font-size: 8px;
+            margin-bottom: 1px;
         }
         
         /* Statistics */
@@ -1183,6 +1755,7 @@ DASHBOARD_TEMPLATE = """
                 <div class="header-camera-extra" id="rtsp-group" style="display:none;">
                     <input type="text" id="rtsp-url" placeholder="rtsp://...">
                     <button class="btn btn-secondary" type="button" onclick="testRtsp()">Test</button>
+                    <button class="btn btn-secondary" type="button" onclick="diagnoseRtsp()">Diagnose</button>
                 </div>
                 <div class="header-camera-extra" id="file-group" style="display:none;">
                     <input type="text" id="file-path" placeholder="video.mp4">
@@ -1348,26 +1921,79 @@ DASHBOARD_TEMPLATE = """
         }
         
         function loadCameras() {
+            const grid = document.getElementById('camera-grid');
+            if (!grid) {
+                console.error('Camera grid element not found!');
+                return;
+            }
+            
+            // Show loading state
+            grid.innerHTML = '<div style="grid-column: 1/-1; text-align: center; padding: 40px; color: #888;">Loading cameras...</div>';
+            
             fetch('/api/cameras')
-                .then(r => r.json())
+                .then(r => {
+                    if (!r.ok) {
+                        throw new Error(`HTTP error! status: ${r.status}`);
+                    }
+                    return r.json();
+                })
                 .then(data => {
-                    const grid = document.getElementById('camera-grid');
                     grid.innerHTML = '';
 
-                    // Atur jumlah kolom grid berdasarkan view mode
-                    let cols = 1;
-                    if (currentViewMode >= 2) cols = 2;
-                    if (currentViewMode >= 4) cols = 2;  // 2x2 untuk 4 cam
-                    if (currentViewMode >= 8) cols = 4;  // 4 per baris untuk 8/16 cam
-                    grid.style.gridTemplateColumns = `repeat(${cols}, minmax(250px, 1fr))`;
+                    // Check if data and cameras exist
+                    if (!data || !data.cameras || data.cameras.length === 0) {
+                        grid.innerHTML = `
+                            <div style="grid-column: 1/-1; text-align: center; padding: 60px; color: #888; background: #111; border: 2px solid #333; border-radius: 8px;">
+                                <div style="font-size: 24px; margin-bottom: 20px;">📹</div>
+                                <div style="font-size: 18px; margin-bottom: 10px; color: #fff;">No Cameras Added Yet</div>
+                                <div style="font-size: 14px; color: #666;">Add a camera using the form above</div>
+                            </div>
+                        `;
+                        return;
+                    }
 
-                    // Pilih kamera yang akan ditampilkan berdasarkan view mode
+                    // Set grid columns based on view mode
+                    let cols = 1;
+                    if (currentViewMode === 1) cols = 1;
+                    else if (currentViewMode === 2) cols = 2;
+                    else if (currentViewMode === 4) cols = 2;  // 2x2 layout
+                    else if (currentViewMode === 8) cols = 4;  // 4x2 layout (2 rows x 4 cols)
+                    else if (currentViewMode === 16) cols = 4; // 4x4 layout
+                    grid.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
+
+                    // Add body class for CSS per-mode styling
+                    document.body.classList.remove('view-mode-1','view-mode-2','view-mode-4','view-mode-8','view-mode-16');
+                    document.body.classList.add(`view-mode-${currentViewMode}`);
+
+                    // Select cameras to display based on view mode
                     const camerasToShow = data.cameras.slice(0, currentViewMode);
+                    
+                    if (camerasToShow.length === 0) {
+                        grid.innerHTML = `
+                            <div style="grid-column: 1/-1; text-align: center; padding: 60px; color: #888; background: #111; border: 2px solid #333; border-radius: 8px;">
+                                <div style="font-size: 24px; margin-bottom: 20px;">📹</div>
+                                <div style="font-size: 18px; margin-bottom: 10px; color: #fff;">No Cameras to Display</div>
+                                <div style="font-size: 14px; color: #666;">Add cameras or adjust view mode</div>
+                            </div>
+                        `;
+                        return;
+                    }
                     
                     camerasToShow.forEach(camera => {
                         const card = createCameraCard(camera);
                         grid.innerHTML += card;
                     });
+                })
+                .catch(error => {
+                    console.error('Error loading cameras:', error);
+                    grid.innerHTML = `
+                        <div style="grid-column: 1/-1; text-align: center; padding: 60px; color: #ff0000; background: #111; border: 2px solid #ff0000; border-radius: 8px;">
+                            <div style="font-size: 24px; margin-bottom: 20px;">❌</div>
+                            <div style="font-size: 18px; margin-bottom: 10px; color: #fff;">Error Loading Cameras</div>
+                            <div style="font-size: 14px; color: #666;">${error.message || 'Unknown error'}</div>
+                            <button onclick="loadCameras()" style="margin-top: 20px; padding: 10px 20px; background: #000; color: #fff; border: 2px solid #fff; cursor: pointer;">Retry</button>
+                        </div>
+                    `;
                 });
         }
         
@@ -1375,28 +2001,47 @@ DASHBOARD_TEMPLATE = """
             return `
                 <div class="camera-card">
                     <div class="camera-header">
-                        <div class="camera-title">${camera.name}</div>
+                        <div class="camera-title">${camera.name.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>
                         <div class="camera-status">
                             <div class="status-dot ${camera.status === 'active' ? 'active' : ''}"></div>
                             <div class="status-text">${camera.status.toUpperCase()}</div>
                         </div>
                     </div>
                     <div class="video-container">
-                        <img class="video-feed" src="/camera_feed/${camera.id}" alt="${camera.name}">
+                        <img class="video-feed" src="/camera_feed/${camera.id}" alt="${camera.name.replace(/</g, '&lt;').replace(/>/g, '&gt;')}">
                     </div>
                     <div class="camera-info">
-                        <div class="info-text">Source: ${camera.source}</div>
+                        <div class="info-text">Source: ${camera.source.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>
                         <div class="info-text">ID: CAM-${camera.id}</div>
                     </div>
                     <div class="camera-controls">
-                        <button class="control-btn start" onclick="startCamera(${camera.id})">Start</button>
-                        <button class="control-btn stop" onclick="stopCamera(${camera.id})">Stop</button>
-                        <button class="control-btn" onclick='editCamera(${camera.id}, ${JSON.stringify(camera.name)}, ${JSON.stringify(camera.source)})'>Edit</button>
-                        <button class="control-btn stop" onclick="deleteCamera(${camera.id})">Delete</button>
+                        <button class="control-btn start" data-action="start" data-camera-id="${camera.id}">Start</button>
+                        <button class="control-btn stop" data-action="stop" data-camera-id="${camera.id}">Stop</button>
+                        <button class="control-btn" data-action="edit" data-camera-id="${camera.id}" data-camera-name="${camera.name.replace(/"/g, '&quot;')}" data-camera-source="${camera.source.replace(/"/g, '&quot;')}">Edit</button>
+                        <button class="control-btn stop" data-action="delete" data-camera-id="${camera.id}">Delete</button>
                     </div>
                 </div>
             `;
         }
+        
+        // Delegated event listener for camera buttons
+        document.addEventListener('click', (e) => {
+            const btn = e.target.closest('[data-action]');
+            if (!btn) return;
+            
+            const action = btn.dataset.action;
+            const cameraId = parseInt(btn.dataset.cameraId, 10);
+            
+            if (action === 'start') {
+                startCamera(cameraId);
+            } else if (action === 'stop') {
+                stopCamera(cameraId);
+            } else if (action === 'edit') {
+                editCamera(cameraId, btn.dataset.cameraName, btn.dataset.cameraSource);
+            } else if (action === 'delete') {
+                deleteCamera(cameraId);
+            }
+        });
         
         function loadStatistics() {
             fetch('/api/statistics')
@@ -1579,6 +2224,10 @@ DASHBOARD_TEMPLATE = """
                 return;
             }
             
+            const btn = event.target;
+            btn.disabled = true;
+            btn.textContent = 'Testing...';
+            
             fetch('/api/test_rtsp', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
@@ -1594,6 +2243,61 @@ DASHBOARD_TEMPLATE = """
                 })
                 .catch(() => {
                     alert('Terjadi error saat mengetes RTSP');
+                })
+                .finally(() => {
+                    btn.disabled = false;
+                    btn.textContent = 'Test';
+                });
+        }
+        
+        function diagnoseRtsp() {
+            const url = document.getElementById('rtsp-url').value;
+            if (!url) {
+                alert('Masukkan RTSP URL terlebih dahulu');
+                return;
+            }
+            
+            const btn = event.target;
+            btn.disabled = true;
+            btn.textContent = 'Diagnosing...';
+            
+            fetch('/api/diagnose_rtsp', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({url})
+            })
+                .then(r => r.json())
+                .then(data => {
+                    let message = 'DIAGNOSTIC RESULTS:\\n\\n';
+                    
+                    if (data.diagnostic) {
+                        const reachable = data.diagnostic.network_reachable ? 'YES' : 'NO';
+                        message += 'Network Reachable: ' + reachable + '\\n';
+                        const portOpen = data.diagnostic.rtsp_port_open ? 'YES' : 'NO';
+                        message += 'RTSP Port Open: ' + portOpen + '\\n\\n';
+                        
+                        if (data.working_url) {
+                            message += 'WORKING URL FOUND:\\n' + data.working_url + '\\n\\n';
+                        }
+                        
+                        if (data.diagnostic.recommendations && data.diagnostic.recommendations.length > 0) {
+                            message += 'RECOMMENDATIONS:\\n';
+                            for (let i = 0; i < Math.min(5, data.diagnostic.recommendations.length); i++) {
+                                message += '- ' + data.diagnostic.recommendations[i] + '\\n';
+                            }
+                        }
+                    } else {
+                        message += data.message || 'Diagnostic failed';
+                    }
+                    
+                    alert(message);
+                })
+                .catch(() => {
+                    alert('Terjadi error saat diagnose RTSP');
+                })
+                .finally(() => {
+                    btn.disabled = false;
+                    btn.textContent = 'Diagnose';
                 });
         }
         
@@ -1721,9 +2425,17 @@ DASHBOARD_TEMPLATE = """
             }
         }, 5000);
         
-        // Initialize
-        loadCameras();
-        loadStatistics();
+        // Initialize when DOM is ready
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', function() {
+                loadCameras();
+                loadStatistics();
+            });
+        } else {
+            // DOM already loaded
+            loadCameras();
+            loadStatistics();
+        }
     </script>
 </body>
 </html>
@@ -1800,6 +2512,8 @@ def add_camera():
     data = request.get_json()
     name = data.get('name')
     source = data.get('source')
+    if isinstance(source, str):
+        source = source.strip()
     
     conn = sqlite3.connect('apd_monitoring.db')
     cursor = conn.cursor()
@@ -1824,6 +2538,8 @@ def start_camera(camera_id):
         return jsonify({'success': False, 'error': 'Camera not found'})
     
     camera_source = result[0]
+    if isinstance(camera_source, str):
+        camera_source = camera_source.strip()
     success = start_camera_monitoring(camera_id, camera_source)
     
     if success:
@@ -1844,47 +2560,76 @@ def stop_camera(camera_id):
 
 @app.route('/api/test_rtsp', methods=['POST'])
 def test_rtsp():
-    """Test a given RTSP URL before adding camera"""
+    """Test a given RTSP URL before adding camera (quick test)"""
     data = request.get_json() or {}
     url = (data.get('url') or '').strip()
     
     if not url:
         return jsonify({'success': False, 'message': 'RTSP URL is required'}), 400
     
-    methods = [
-        ('Direct', url),
-        ('TCP', f"{url}?transport=tcp"),
-        ('UDP', f"{url}?transport=udp")
-    ]
+    # Quick test dengan timeout pendek
+    result = test_rtsp_connection(url, timeout_sec=5)
     
-    for method_name, test_url in methods:
+    if result['success'] and result['cap']:
         try:
-            cap = cv2.VideoCapture(test_url)
-            if cap.isOpened():
-                ret, frame = cap.read()
-                if ret:
-                    height, width = frame.shape[:2]
-                    cap.release()
-                    return jsonify({
-                        'success': True,
-                        'message': f'{method_name} connection OK ({width}x{height})',
-                        'method': method_name,
-                        'width': width,
-                        'height': height
-                    })
-            if cap:
-                cap.release()
-        except Exception as e:
-            try:
-                if cap:
-                    cap.release()
-            except Exception:
-                pass
+            ret, frame = result['cap'].read()
+            if ret and frame is not None:
+                height, width = frame.shape[:2]
+                result['cap'].release()
+                return jsonify({
+                    'success': True,
+                    'message': f'Connection OK ({width}x{height})',
+                    'width': width,
+                    'height': height
+                })
+        except:
+            if result['cap']:
+                result['cap'].release()
     
     return jsonify({
         'success': False,
-        'message': 'Failed to connect to RTSP stream with tested methods'
+        'message': result.get('error', 'Failed to connect to RTSP stream')
     }), 500
+
+@app.route('/api/diagnose_rtsp', methods=['POST'])
+def diagnose_rtsp():
+    """Diagnose RTSP connection dengan detail lengkap"""
+    data = request.get_json() or {}
+    url = (data.get('url') or '').strip()
+    
+    if not url:
+        return jsonify({'success': False, 'message': 'RTSP URL is required'}), 400
+    
+    print(f"\n{'='*60}")
+    print(f"🔍 DIAGNOSING RTSP CONNECTION")
+    print(f"{'='*60}")
+    print(f"URL: {url}")
+    print(f"{'='*60}\n")
+    
+    # Run diagnostic
+    diagnostic = diagnose_rtsp_connection(url, timeout_sec=8)
+    
+    print(f"\n{'='*60}")
+    print(f"📊 DIAGNOSTIC RESULTS")
+    print(f"{'='*60}")
+    print(f"Network Reachable: {diagnostic['network_reachable']}")
+    print(f"RTSP Port Open: {diagnostic['rtsp_port_open']}")
+    print(f"Tests Performed: {len(diagnostic['connection_tests'])}")
+    print(f"{'='*60}\n")
+    
+    # Find successful connection
+    successful_test = None
+    for test in diagnostic['connection_tests']:
+        if test['success']:
+            successful_test = test
+            break
+    
+    return jsonify({
+        'success': successful_test is not None,
+        'diagnostic': diagnostic,
+        'working_url': successful_test['url'] if successful_test else None,
+        'message': successful_test['name'] + ' - ' + successful_test['url'] if successful_test else diagnostic.get('recommendations', ['Connection failed'])[0]
+    })
 
 @app.route('/api/camera/<int:camera_id>', methods=['PUT', 'POST', 'DELETE'])
 def camera_detail(camera_id):
@@ -1895,6 +2640,8 @@ def camera_detail(camera_id):
         data = request.get_json() or {}
         name = data.get('name')
         source = data.get('source')
+        if isinstance(source, str):
+            source = source.strip()
         
         if not name or not source:
             return jsonify({'success': False, 'error': 'Name and source are required'}), 400
