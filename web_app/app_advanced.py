@@ -247,6 +247,17 @@ def test_rtsp_connection(url, timeout_sec=5):
             try:
                 os.environ['OPENCV_FFMPEG_READ_ATTEMPTS'] = '1'
                 os.environ['OPENCV_FFMPEG_READ_ATTEMPT_MSEC'] = str(timeout_ms)
+                
+                # Parse transport from url and set environment variable correctly for OpenCV FFmpeg
+                if '?transport=tcp' in url:
+                    os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;tcp'
+                    url = url.replace('?transport=tcp', '')
+                elif '?transport=udp' in url:
+                    os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;udp'
+                    url = url.replace('?transport=udp', '')
+                else:
+                    # TCP Transport often more reliable for wifi/lan
+                    os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;tcp'
             except:
                 pass
             
@@ -532,10 +543,33 @@ def start_camera_monitoring(camera_id, camera_source):
             
     else:
         # Regular webcam/file connection
-        cap = cv2.VideoCapture(int(camera_source) if camera_source.isdigit() else camera_source)
+        source = int(camera_source) if camera_source.isdigit() else camera_source
+        
+        # On Windows, the default MSMF backend sometimes claims isOpened()=True but cannot read frames.
+        # So we prioritize DirectShow (CAP_DSHOW) for physical webcams.
+        if isinstance(source, int) and os.name == 'nt':
+            print(f"📡 Using DSHOW backend for webcam {source} on Windows...")
+            cap = cv2.VideoCapture(source, cv2.CAP_DSHOW)
+            
+            # Test if we can actually read a frame
+            ret, _ = cap.read()
+            if not ret:
+                print(f"⚠️ DSHOW failed to read frame, falling back to default backend...")
+                cap = cv2.VideoCapture(source)
+        else:
+            cap = cv2.VideoCapture(source)
+            
         if not cap.isOpened():
             print(f"❌ Failed to open camera source: {camera_source}")
             return False
+            
+        # Try reading a test frame to ensure it actually works
+        ret, _ = cap.read()
+        if not ret:
+            print(f"❌ Camera source opened but failed to read frames: {camera_source}")
+            cap.release()
+            return False
+            
         cameras[camera_id] = cap
     
     # Safety: make sure camera handle really exists before starting thread
@@ -2908,9 +2942,21 @@ def camera_feed(camera_id):
                    mimetype='multipart/x-mixed-replace; boundary=frame')
 
 if __name__ == '__main__':
+    import socket
+    
+    # Get local LAN IP Address
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        local_ip = '127.0.0.1'
+
     print("🚀 Starting Advanced APD Monitoring System...")
     print("🔐 Features: Login, Multi-Camera, Data Recap")
-    print("📊 Open http://localhost:5000 in your browser")
+    print(f"📊 Open http://{local_ip}:5000 in your browser to access from another device")
     print("👤 Default Login: admin / admin123")
     
+    # Run the app on all interfaces bound to port 5000
     app.run(host='0.0.0.0', port=5000, debug=False)
