@@ -81,7 +81,7 @@ class ViolationsDetector:
                     bbox_width = x2 - x1
                     bbox_height = y2 - y1
                     
-                    if bbox_width < 15 or bbox_height < 15:  # Reduced from 20
+                    if bbox_width < 8 or bbox_height < 8:  # Reduced from 15 completely to catch distant Helmets
                         continue
                     
                     # Only process violations (No_Helmet, No_Vest)

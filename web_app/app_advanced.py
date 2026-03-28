@@ -88,7 +88,7 @@ def init_db():
 init_db()
 
 # Global variables
-detector = ViolationsDetector(confidence_threshold=0.3)
+detector = ViolationsDetector(confidence_threshold=0.15)
 cameras = {}
 camera_threads = {}
 camera_stats = {}
