@@ -12,6 +12,15 @@ try:
 except ImportError:
     scaling_config = None
 
+try:
+    from src.face_recognition import FaceRecognitionSystem
+except ImportError:
+    import sys
+    import os
+    sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+    from src.face_recognition import FaceRecognitionSystem
+
+
 class ViolationsDetector:
     def __init__(self, confidence_threshold=0.5):
         """
@@ -47,6 +56,17 @@ class ViolationsDetector:
         
         # Optimize for performance
         self.model.fuse()  # Fuse Conv and BatchNorm for faster inference
+        
+        # Initialize Face Recognition
+        self.recognition_cooldowns = {} # (location) -> last_time
+        try:
+            self.face_recognizer = FaceRecognitionSystem()
+            self.use_face_recognition = len(self.face_recognizer.face_encodings) > 0
+            print(f"👤 Face Recognition: {'Active' if self.use_face_recognition else 'Inactive (No registered workers)'}")
+        except Exception as e:
+            print(f"⚠️ Failed to initialize Face Recognition: {e}")
+            self.face_recognizer = None
+            self.use_face_recognition = False
         
         print("✅ Optimized Violations Detector initialized")
         print(f"📊 Classes: {list(self.class_names.values())}")
@@ -99,11 +119,50 @@ class ViolationsDetector:
                                 class_name
                             )
                         
+                        # Try to recognize face if active
+                        worker_id = "Unknown"
+                        
+                        # PERFORMANCE FIX: Only try to recognize every 2 seconds for this location
+                        current_time = datetime.now().timestamp()
+                        # Use grid-based key for location to account for movement
+                        loc_key = f"{camera_id}_{int(center_x/20)}_{int(center_y/20)}"
+                        last_try = self.recognition_cooldowns.get(loc_key, 0)
+                        
+                        if self.use_face_recognition and (current_time - last_try > 2.0):
+                            self.recognition_cooldowns[loc_key] = current_time
+                            try:
+                                # Crop the scaled bbox region
+                                sx1, sy1, sx2, sy2 = scaled_bbox
+                                crop_region = frame[max(0, sy1):min(frame.shape[0], sy2), 
+                                                 max(0, sx1):min(frame.shape[1], sx2)]
+                                
+                                if crop_region.size > 0:
+                                    recognized = None
+                                    
+                                    # Fallback: if 'nohelmet', use scaled_bbox directly
+                                    if class_name == 'No_Helmet':
+                                        recognized = self.face_recognizer.recognize_face(frame, scaled_bbox)
+                                    
+                                    # Still try Haar Cascade if needed
+                                    if not recognized:
+                                        faces = self.face_recognizer.detect_faces(crop_region)
+                                        if faces:
+                                            fx1, fy1, fx2, fy2 = faces[0]['bbox']
+                                            global_face_bbox = [sx1 + fx1, sy1 + fy1, sx1 + fx2, sy1 + fy2]
+                                            recognized = self.face_recognizer.recognize_face(frame, global_face_bbox)
+                                            
+                                    if recognized:
+                                        metadata = self.face_recognizer.face_metadata.get(recognized, {})
+                                        worker_id = metadata.get('name', recognized)
+                            except Exception as e:
+                                pass
+                        
                         # Add violation detection
                         violations.append({
                             'bbox': scaled_bbox,
                             'class': class_name.lower().replace('_', ''),
                             'confidence': float(confidence),
+                            'worker_id': worker_id,
                             'violation_severity': 'high',
                             'violation_info': {
                                 'has_helmet': False,
@@ -198,12 +257,13 @@ class ViolationsDetector:
             confidence = detection['confidence']
             
             # Color based on violation type
+            worker_id = detection.get('worker_id', 'Unknown')
             if class_name == 'nohelmet':
                 color = (0, 0, 255)  # Red for no helmet violation
-                label = f"No Helmet {confidence:.2f}"
+                label = f"No Helmet {confidence:.2f} [{worker_id}]"
             elif class_name == 'novest':
                 color = (0, 165, 255)  # Orange for no vest violation
-                label = f"No Vest {confidence:.2f}"
+                label = f"No Vest {confidence:.2f} [{worker_id}]"
             else:
                 continue  # Skip unknown classes
             

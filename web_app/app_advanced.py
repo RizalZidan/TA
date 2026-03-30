@@ -673,6 +673,8 @@ def monitor_camera(camera_id, cap):
             tracked_persons[camera_id] = {}
         
         for detection in detections:
+            if camera_id not in tracked_persons:
+                break
             class_name = detection['class']
             
             # Create person ID based on bounding box position
@@ -685,6 +687,7 @@ def monitor_camera(camera_id, cap):
             if person_id not in tracked_persons[camera_id]:
                 tracked_persons[camera_id][person_id] = {
                     'last_seen': current_time,
+                    'worker_id': 'Unknown',
                     'violations': {
                         'no_helmet': False,
                         'no_vest': False
@@ -692,6 +695,12 @@ def monitor_camera(camera_id, cap):
                 }
             
             person_data = tracked_persons[camera_id][person_id]
+            
+            # USE CACHED Recognition if available
+            if detection['worker_id'] != 'Unknown':
+                person_data['worker_id'] = detection['worker_id']
+            else:
+                detection['worker_id'] = person_data['worker_id']
             
             # Check if this is a new detection (after cooldown)
             if current_time - person_data['last_seen'] > detection_cooldown:
@@ -1473,7 +1482,42 @@ DASHBOARD_TEMPLATE = """
             margin-bottom: 1px;
         }
         
-        /* Statistics */
+        /* Sub-navigation inside tabs */
+        .sub-nav {
+            display: flex;
+            gap: 20px;
+            margin-bottom: 25px;
+            border-bottom: 1px solid #333;
+            padding-bottom: 15px;
+        }
+        .sub-nav-item {
+            color: #888;
+            font-size: 13px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            position: relative;
+        }
+        .sub-nav-item.active {
+            color: #fff;
+        }
+        .sub-nav-item.active::after {
+            content: '';
+            position: absolute;
+            bottom: -16px;
+            left: 0;
+            width: 100%;
+            height: 2px;
+            background: #fff;
+        }
+        .sub-section {
+            display: none;
+        }
+        .sub-section.active {
+            display: block;
+        }
         .stats-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
@@ -1808,6 +1852,7 @@ DASHBOARD_TEMPLATE = """
         <div class="sidebar">
             <div class="nav-tabs">
                 <div class="nav-tab active" onclick="showTab('cameras')">Cameras</div>
+                <div class="nav-tab" onclick="showTab('workers')">Workers</div>
                 <div class="nav-tab" onclick="showTab('statistics')">Statistics</div>
                 <div class="nav-tab" onclick="showTab('violations')">Violations</div>
                 <div class="nav-tab" onclick="showTab('settings')">Settings</div>
@@ -1829,6 +1874,69 @@ DASHBOARD_TEMPLATE = """
                     </div>
                     <div class="camera-grid" id="camera-grid">
                         <!-- Camera cards will be loaded here -->
+                    </div>
+                </div>
+                
+                <!-- Workers Tab -->
+                <div id="workers" class="tab-content">
+                    <div class="violations-table">
+                        <div class="table-header">
+                            <div class="table-title">👥 Manajemen Pekerja</div>
+                        </div>
+
+                        <!-- Sub-navbar -->
+                        <div class="sub-nav">
+                            <div class="sub-nav-item active" id="btn-list-worker" onclick="showWorkerSection('list')">List Workers</div>
+                            <div class="sub-nav-item" id="btn-register-worker" onclick="showWorkerSection('register')">Register New Worker</div>
+                        </div>
+
+                        <!-- User List Section -->
+                        <div id="worker-list-section" class="sub-section active">
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>ID</th>
+                                        <th>Name</th>
+                                        <th>Images</th>
+                                        <th>Registered Date</th>
+                                        <th>Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="workers-tbody">
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <!-- Registration Form Section -->
+                        <div id="worker-register-section" class="sub-section">
+                            <div class="stats-section" style="background:#111; padding:30px; border:1px solid #333;">
+                                <h3 style="margin-bottom:25px; font-size:16px; color:#fff; text-transform:uppercase; letter-spacing:1px;">Form Pendaftaran Wajah</h3>
+                                <form id="worker-form" onsubmit="registerWorker(event)">
+                                    <div style="display:flex; flex-direction:column; gap:20px;">
+                                        <div style="display:flex; gap:20px; flex-wrap:wrap">
+                                            <div class="form-group" style="flex:1; min-width:150px">
+                                                <label>Worker ID</label>
+                                                <input type="text" id="worker-id" required placeholder="e.g. W001">
+                                            </div>
+                                            <div class="form-group" style="flex:1; min-width:150px">
+                                                <label>Full Name</label>
+                                                <input type="text" id="worker-name" required placeholder="e.g. Budi Santoso">
+                                            </div>
+                                        </div>
+                                        <div class="form-group">
+                                            <label>Upload Face Images (Min 3-5 images for better accuracy)</label>
+                                            <div style="background:#000; padding:20px; border:2px dashed #333; text-align:center;">
+                                                <input type="file" id="worker-images" multiple accept="image/jpeg, image/png" required style="width:auto; cursor:pointer;">
+                                                <p style="color:#555; font-size:11px; margin-top:10px;">Select multiple JPG/PNG files from your device</p>
+                                            </div>
+                                        </div>
+                                        <div style="display:flex; justify-content:flex-end; margin-top:10px;">
+                                            <button type="submit" class="btn btn-primary" id="worker-submit-btn" style="padding: 15px 40px;">Mulai Registrasi</button>
+                                        </div>
+                                    </div>
+                                </form>
+                            </div>
+                        </div>
                     </div>
                 </div>
                 
@@ -1951,6 +2059,23 @@ DASHBOARD_TEMPLATE = """
                 loadStatistics();
             } else if (tabName === 'violations') {
                 loadViolations();
+            } else if (tabName === 'workers') {
+                showWorkerSection('list');
+            }
+        }
+        
+        function showWorkerSection(section) {
+            // Hide all sub-sections
+            document.querySelectorAll('.sub-section').forEach(s => s.classList.remove('active'));
+            document.querySelectorAll('.sub-nav-item').forEach(s => s.classList.remove('active'));
+            
+            if (section === 'list') {
+                document.getElementById('worker-list-section').classList.add('active');
+                document.getElementById('btn-list-worker').classList.add('active');
+                loadWorkers();
+            } else if (section === 'register') {
+                document.getElementById('worker-register-section').classList.add('active');
+                document.getElementById('btn-register-worker').classList.add('active');
             }
         }
         
@@ -2205,6 +2330,77 @@ DASHBOARD_TEMPLATE = """
             window.open(url);
         }
         
+        function loadWorkers() {
+            fetch('/api/workers')
+                .then(r => r.json())
+                .then(data => {
+                    const tbody = document.getElementById('workers-tbody');
+                    if(!tbody) return;
+                    tbody.innerHTML = '';
+                    
+                    data.workers.forEach(w => {
+                        const row = document.createElement('tr');
+                        const date = new Date(w.registration_date);
+                        row.innerHTML = `
+                            <td>${w.worker_id}</td>
+                            <td>${w.name}</td>
+                            <td>${w.num_images}</td>
+                            <td>${date.toLocaleString()}</td>
+                            <td><button class="btn btn-secondary" onclick="deleteWorker('${w.worker_id}')" style="padding:4px 8px; font-size:11px; background:#f00; color:#fff; border:none; cursor:pointer;">Delete</button></td>
+                        `;
+                        tbody.appendChild(row);
+                    });
+                });
+        }
+
+        function registerWorker(e) {
+            e.preventDefault();
+            const btn = document.getElementById('worker-submit-btn');
+            btn.disabled = true;
+            btn.textContent = 'Registering...';
+            
+            const formData = new FormData();
+            formData.append('worker_id', document.getElementById('worker-id').value);
+            formData.append('name', document.getElementById('worker-name').value);
+            
+            const files = document.getElementById('worker-images').files;
+            for(let i=0; i<files.length; i++){
+                formData.append('images', files[i]);
+            }
+            
+            fetch('/api/workers/register', {
+                method: 'POST',
+                body: formData
+            })
+            .then(r => r.json())
+            .then(data => {
+                if(data.success){
+                    alert('Worker registered successfully!');
+                    document.getElementById('worker-form').reset();
+                    loadWorkers();
+                } else {
+                    alert('Failed: ' + data.message);
+                }
+            })
+            .catch(err => alert('Error registering worker'))
+            .finally(() => {
+                btn.disabled = false;
+                btn.textContent = 'Register';
+            });
+        }
+
+        function deleteWorker(id) {
+            if(!confirm('Delete worker ' + id + '?')) return;
+            fetch('/api/workers/' + id, {method: 'DELETE'})
+            .then(r => r.json())
+            .then(data => {
+                if(data.success){
+                    loadWorkers();
+                } else {
+                    alert('Failed to delete');
+                }
+            });
+        }
         
         function changeViewMode() {
             const select = document.getElementById('view-mode');
@@ -2517,6 +2713,52 @@ def dashboard():
     return render_template_string(DASHBOARD_TEMPLATE)
 
 # API routes
+@app.route('/api/workers')
+def get_workers():
+    if hasattr(detector, 'face_recognizer') and detector.face_recognizer:
+        workers = detector.face_recognizer.get_registered_workers()
+        return jsonify({'workers': workers})
+    return jsonify({'workers': []})
+
+@app.route('/api/workers/register', methods=['POST'])
+def register_worker():
+    worker_id = request.form.get('worker_id')
+    name = request.form.get('name')
+    files = request.files.getlist('images')
+    
+    if not worker_id or not name or not files:
+        return jsonify({'success': False, 'message': 'Missing data'})
+        
+    # Ensure FaceRecognizer is initialized
+    if not hasattr(detector, 'face_recognizer') or not detector.face_recognizer:
+        from src.face_recognition import FaceRecognitionSystem
+        detector.face_recognizer = FaceRecognitionSystem()
+        
+    # Save files to a temporary folder
+    worker_folder = os.path.join('data', 'workers', worker_id)
+    os.makedirs(worker_folder, exist_ok=True)
+    
+    for f in files:
+        if f.filename:
+            f.save(os.path.join(worker_folder, f.filename))
+            
+    # Register
+    success = detector.face_recognizer.register_worker(worker_id, name, worker_folder)
+    if success:
+        detector.use_face_recognition = True
+        return jsonify({'success': True})
+    else:
+        return jsonify({'success': False, 'message': 'Failed to extract face features from images'})
+
+@app.route('/api/workers/<worker_id>', methods=['DELETE'])
+def delete_worker(worker_id):
+    if hasattr(detector, 'face_recognizer') and detector.face_recognizer:
+        success = detector.face_recognizer.remove_worker(worker_id)
+        if len(detector.face_recognizer.face_encodings) == 0:
+            detector.use_face_recognition = False
+        return jsonify({'success': success})
+    return jsonify({'success': False})
+
 @app.route('/api/cameras')
 def get_cameras():
     conn = sqlite3.connect('apd_monitoring.db')

@@ -12,7 +12,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from pathlib import Path
 
 class FaceRecognitionSystem:
-    def __init__(self, similarity_threshold=0.6):
+    def __init__(self, similarity_threshold=0.45):
         """
         Initialize Face Recognition System
         
@@ -80,6 +80,17 @@ class FaceRecognitionSystem:
         """
         x1, y1, x2, y2 = map(int, bbox)
         
+        # Ensure coordinates are within frame bounds
+        h, w = frame.shape[:2]
+        x1 = max(0, min(x1, w-1))
+        y1 = max(0, min(y1, h-1))
+        x2 = max(0, min(x2, w-1))
+        y2 = max(0, min(y2, h-1))
+        
+        # Ensure positive region (x2 > x1, y2 > y1)
+        if x2 <= x1 or y2 <= y1:
+            return None
+            
         # Extract face region
         face_region = frame[y1:y2, x1:x2]
         
@@ -87,15 +98,21 @@ class FaceRecognitionSystem:
             return None
         
         try:
-            # Resize to standard size
+            # Resize to standard size (64x64 for Histograms)
             face_resized = cv2.resize(face_region, (64, 64))
             
             # Convert to different color spaces
             face_gray = cv2.cvtColor(face_resized, cv2.COLOR_BGR2GRAY)
+            
+            # Standardize face image (CLAHE for much better lighting robustness)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            face_gray = clahe.apply(face_gray)
+            
+            # Re-convert to color after equalization if needed or use gray for pixels
             face_hsv = cv2.cvtColor(face_resized, cv2.COLOR_BGR2HSV)
             
             # Extract features
-            # Histogram features
+            # 1. Color Histograms
             hist_b = cv2.calcHist([face_resized], [0], None, [16], [0, 256])
             hist_g = cv2.calcHist([face_resized], [1], None, [16], [0, 256])
             hist_r = cv2.calcHist([face_resized], [2], None, [16], [0, 256])
@@ -111,14 +128,44 @@ class FaceRecognitionSystem:
             hist_h = cv2.normalize(hist_h, hist_h).flatten()
             hist_s = cv2.normalize(hist_s, hist_s).flatten()
             
-            # Combine features
-            features = np.concatenate([
-                hist_b, hist_g, hist_r, hist_gray, hist_h, hist_s
-            ])
+            # 2. EDGE & SHAPE FEATURES (HOG Lite)
+            # Use larger strides for much higher FPS
+            try:
+                win_size = (64, 64)
+                block_size = (16, 16)
+                block_stride = (16, 16) 
+                cell_size = (16, 16)
+                nbins = 9
+                hog = cv2.HOGDescriptor(win_size, block_size, block_stride, cell_size, nbins)
+                hog_features = hog.compute(face_gray).flatten()
+            except:
+                hog_features = np.zeros(324, dtype=np.float32)
             
-            # Add pixel intensity features
-            pixel_features = face_gray.flatten() / 255.0
-            features = np.concatenate([features, pixel_features[:1000]])  # Limit size
+            # 3. LBP (Local Binary Patterns) - Lightweight & Robust Texture
+            # Hand-coded simple LBP for speed and accuracy
+            lbp = np.zeros_like(face_gray)
+            # Optimized simple inner loop
+            f_g = face_gray.astype(np.int32)
+            for i in range(1, 63, 2): # Stepped for speed
+                for j in range(1, 63, 2):
+                    c = f_g[i, j]
+                    code = 0
+                    if f_g[i-1, j-1] >= c: code |= 128
+                    if f_g[i-1, j] >= c:   code |= 64
+                    if f_g[i-1, j+1] >= c: code |= 32
+                    if f_g[i, j+1] >= c:   code |= 16
+                    if f_g[i+1, j+1] >= c: code |= 8
+                    if f_g[i+1, j] >= c:   code |= 4
+                    if f_g[i+1, j-1] >= c: code |= 2
+                    if f_g[i, j-1] >= c:   code |= 1
+                    lbp[i, j] = code
+            lbp_hist = cv2.calcHist([lbp], [0], None, [32], [1, 256]) # Skip 0
+            lbp_hist = cv2.normalize(lbp_hist, lbp_hist).flatten()
+            
+            # Combine all features (Histograms + HOG + LBP)
+            features = np.concatenate([
+                hist_b, hist_g, hist_r, hist_gray, hist_h, hist_s, hog_features, lbp_hist
+            ])
             
             return features
             
@@ -143,22 +190,42 @@ class FaceRecognitionSystem:
         if face_encoding is None:
             return None
         
+        # Prepare current encoding for vector math
+        face_encoding = face_encoding.reshape(1, -1)
+        
         # Compare with known faces
         best_match_id = None
         best_similarity = 0
+        overall_best_sim = 0
         
         for worker_id, encodings in self.face_encodings.items():
-            for stored_encoding in encodings:
-                # Calculate cosine similarity
-                similarity = cosine_similarity(
-                    [face_encoding], 
-                    [stored_encoding]
-                )[0][0]
+            if not encodings: continue
+            
+            # Conver list to numpy for batch similarity
+            all_stored = np.array(encodings)
+            
+            # Calculate similarity scores using batch dot product (faster for FPS)
+            # Since vectors are normalized (due to hist norm + manual), dot product is approx cosine similarity
+            # Actually, proper cosine sim is preferred
+            try:
+                similarities = cosine_similarity(face_encoding, all_stored)[0]
+                worker_max_sim = np.max(similarities)
+            except:
+                worker_max_sim = 0
                 
-                if similarity > best_similarity and similarity >= self.similarity_threshold:
-                    best_similarity = similarity
+            overall_best_sim = max(overall_best_sim, worker_max_sim)
+                
+            if worker_max_sim > best_similarity:
+                best_similarity = worker_max_sim
+                if worker_max_sim >= self.similarity_threshold:
                     best_match_id = worker_id
         
+        # DEBUG LOGGING (Reduced to only found or significant)
+        if best_match_id:
+            print(f"👤 Face recognized: {best_match_id} (Similarity: {best_similarity:.4f})")
+        elif overall_best_sim > 0.4:
+            print(f"👤 Face unknown (Best: {overall_best_sim:.4f}, Threshold: {self.similarity_threshold})")
+            
         if best_match_id:
             return best_match_id
         else:
@@ -266,7 +333,7 @@ class FaceRecognitionSystem:
                 
                 self.face_encodings = database.get('encodings', {})
                 self.face_metadata = database.get('metadata', {})
-                self.similarity_threshold = database.get('similarity_threshold', 0.6)
+                self.similarity_threshold = database.get('similarity_threshold', 0.45)
                 
                 print(f"📂 Face database loaded from {self.database_path}")
                 print(f"👥 Registered workers: {len(self.face_encodings)}")
