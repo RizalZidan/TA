@@ -1,3 +1,4 @@
+
 """
 APD Analyzer Module
 Handles APD violation analysis and classification

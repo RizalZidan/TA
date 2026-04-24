@@ -33,9 +33,15 @@ from src.violations_detector import ViolationsDetector
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)
 
+# Project Paths
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+DB_PATH = os.path.join(PROJECT_ROOT, 'data', 'apd_monitoring.db')
+FACE_DB_PATH = os.path.join(PROJECT_ROOT, 'data', 'face_database.pkl')
+MODELS_DIR = os.path.join(PROJECT_ROOT, 'models')
+
 # Initialize database
 def init_db():
-    conn = sqlite3.connect('apd_monitoring.db')
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
     # Users table
@@ -74,6 +80,27 @@ def init_db():
         )
     ''')
     
+    # Workers table (Source of Truth for Names)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS workers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            worker_id TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # NEW: Face recognition log table for accuracy metrics
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS face_recognition_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            worker_id TEXT,
+            similarity REAL,
+            camera_id INTEGER
+        )
+    ''')
+    
     # Create default admin user
     admin_password = hashlib.sha256('admin123'.encode()).hexdigest()
     cursor.execute('''
@@ -84,11 +111,53 @@ def init_db():
     conn.commit()
     conn.close()
 
+    # --- Migration: tambah kolom worker_id jika belum ada ---
+    conn2 = sqlite3.connect(DB_PATH)
+    cur2 = conn2.cursor()
+    try:
+        cur2.execute('ALTER TABLE violations ADD COLUMN worker_id TEXT DEFAULT "Unknown"')
+    except Exception:
+        pass
+        
+    try:
+        cur2.execute('ALTER TABLE violations ADD COLUMN processed BOOLEAN DEFAULT FALSE')
+    except Exception:
+        pass
+        
+    conn2.commit()
+    conn2.close()
+
 # Initialize database on startup
 init_db()
 
-# Global variables
-detector = ViolationsDetector(confidence_threshold=0.15)
+# Use the high-accuracy PREMIER 50-Epoch model (86.03%)
+# Now safe to use because coordinate shifting has been fixed.
+detector = ViolationsDetector(confidence_threshold=0.30)
+
+# Migration: Sync workers from pickle to SQLite if needed
+def sync_workers_to_db():
+    if not hasattr(detector, 'face_recognizer') or not detector.face_recognizer:
+        return
+    
+    fr = detector.face_recognizer
+    if not fr.face_metadata:
+        return
+        
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # Check if workers table is empty
+    cursor.execute('SELECT COUNT(*) FROM workers')
+    if cursor.fetchone()[0] == 0:
+        print("[*] Syncing workers from face database to SQLite...")
+        for worker_id, metadata in fr.face_metadata.items():
+            name = metadata.get('name', worker_id)
+            cursor.execute('INSERT OR IGNORE INTO workers (worker_id, name) VALUES (?, ?)', (worker_id, name))
+        conn.commit()
+    conn.close()
+
+sync_workers_to_db()
+
 cameras = {}
 camera_threads = {}
 camera_stats = {}
@@ -99,11 +168,14 @@ global_stats = {
     'active_cameras': 0
 }
 tracked_persons = {}  # {camera_id: {person_id: {last_seen_time, violations}}}
-detection_cooldown = 1.0
+# Disabled (0) to allow temporal stabilizer to process every frame correctly
+detection_cooldown = 0 
 
 # Global state for frame sharing (Thread-safe)
 camera_frames = {}  # {camera_id: {'frame': frame, 'detections': [], 'timestamp': time.time()}}
 frame_lock = threading.Lock()
+worker_cooldowns = {} # {worker_id: last_violation_time}
+COOLDOWN_SECONDS = 5 # Default global cooldown per ID
 
 # Diagnostic function untuk test RTSP dengan detail
 def diagnose_rtsp_connection(url, timeout_sec=8):
@@ -558,7 +630,6 @@ def start_camera_monitoring(camera_id, camera_source):
                 cap = cv2.VideoCapture(source)
         else:
             cap = cv2.VideoCapture(source)
-            
         if not cap.isOpened():
             print(f"❌ Failed to open camera source: {camera_source}")
             return False
@@ -586,7 +657,7 @@ def start_camera_monitoring(camera_id, camera_source):
     thread.start()
     
     # Update camera status in database
-    conn = sqlite3.connect('apd_monitoring.db')
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('UPDATE cameras SET status = ? WHERE id = ?', ('active', camera_id))
     conn.commit()
@@ -613,7 +684,7 @@ def stop_camera_monitoring(camera_id):
         del camera_stats[camera_id]
     
     # Update camera status in database
-    conn = sqlite3.connect('apd_monitoring.db')
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('UPDATE cameras SET status = ? WHERE id = ?', ('inactive', camera_id))
     conn.commit()
@@ -653,12 +724,43 @@ def monitor_camera(camera_id, cap):
                 break
             time.sleep(0.1)
             continue
+            
+        # --- OPTIMIZATION: BUFFER FLUSHING ---
+        # Grab only the most recent frame if there are many waiting in the buffer
+        # This prevents the stream from lagging behind real-time
+        if frame_count % 5 == 0:
+            for _ in range(5):
+                if camera_id not in cameras:
+                    break
+                temp_ret, temp_frame = cameras[camera_id].read()
+                if temp_ret:
+                    frame = temp_frame
+                else:
+                    break
         
         consecutive_failures = 0  # Reset on success
         
         frame_count += 1
-        detections = detector.detect_violations(frame)
         
+        # --- OPTIMIZATION: FRAME SKIPPING ---
+        # Only run AI every 5 frames to keep the feed smooth (Optimized from 3)
+        if frame_count % 5 == 0:
+            try:
+                detections = detector.detect_violations(frame)
+            except Exception as e:
+                import traceback
+                with open('error_log.txt', 'a') as f:
+                    f.write(f"Error on camera {camera_id}: {str(e)}\n{traceback.format_exc()}\n")
+                print(f"⚠️ Error detecting violations on camera {camera_id}: {str(e)}")
+                detections = []
+        else:
+            # Re-use last detections to avoid flickering while skipping AI
+            with frame_lock:
+                if camera_id in camera_frames:
+                    detections = camera_frames[camera_id].get('detections', [])
+                else:
+                    detections = []
+            
         # Update shared frame for video feed
         with frame_lock:
             camera_frames[camera_id] = {
@@ -678,10 +780,11 @@ def monitor_camera(camera_id, cap):
             class_name = detection['class']
             
             # Create person ID based on bounding box position
+            # IMPROVEMENT: Use a much finer grid (8px) to distinguish between people close together
             bbox = detection.get('bbox', [0, 0, 0, 0])
             center_x = int((bbox[0] + bbox[2]) / 2)
             center_y = int((bbox[1] + bbox[3]) / 2)
-            person_id = f"{class_name}_{center_x}_{center_y}"
+            person_id = f"person_{center_x // 8}_{center_y // 8}"
             
             # Check if this person exists
             if person_id not in tracked_persons[camera_id]:
@@ -691,42 +794,111 @@ def monitor_camera(camera_id, cap):
                     'violations': {
                         'no_helmet': False,
                         'no_vest': False
+                    },
+                    'violation_counters': {
+                        'nohelmet': 0,
+                        'novest': 0
                     }
                 }
             
             person_data = tracked_persons[camera_id][person_id]
+            
+            # --- IMPROVEMENT: Reset counters if APD is found ---
+            # Jika kelasnya 'ok', berarti APD terdeteksi. Reset counter pelanggaran.
+            if class_name == 'helmet_ok':
+                person_data['violation_counters']['nohelmet'] = 0
+                person_data['violations']['no_helmet'] = False
+                # Important: update last_seen even for safe frames to keep tracking alive
+                person_data['last_seen'] = current_time 
+                continue 
+            elif class_name == 'vest_ok':
+                person_data['violation_counters']['novest'] = 0
+                person_data['violations']['no_vest'] = False
+                person_data['last_seen'] = current_time
+                continue
             
             # USE CACHED Recognition if available
             if detection['worker_id'] != 'Unknown':
                 person_data['worker_id'] = detection['worker_id']
             else:
                 detection['worker_id'] = person_data['worker_id']
+
+            # --- STABILIZER LOGIC: Reset on SAFE signal ---
+            if class_name == 'helmet_ok':
+                person_data['violation_counters']['nohelmet'] = 0
+                person_data['violations']['no_helmet'] = False
+                person_data['last_seen'] = current_time
+                continue
+            elif class_name == 'vest_ok':
+                person_data['violation_counters']['novest'] = 0
+                person_data['violations']['no_vest'] = False
+                person_data['last_seen'] = current_time
+                continue
+            
+            # If it's a violation, proceed to logging logic
+            is_no_helmet = (class_name == 'nohelmet')
+            is_no_vest = (class_name == 'novest')
+            
+            if not is_no_helmet and not is_no_vest:
+                person_data['last_seen'] = current_time
+                continue
             
             # Check if this is a new detection (after cooldown)
             if current_time - person_data['last_seen'] > detection_cooldown:
                 
                 # Update violation status
+                # --- LOGIKA STABILIZER TERAPAN ---
+                # Kita hanya mencatat pelanggaran jika terdeteksi secara konsisten selama N frame
+                # Jika terdeteksi aman (APD terpakai), counter langsung reset ke 0.
+                
+                # Cek tipe pelanggaran di data deteksi (ini adalah proxy yang dibuat oleh ViolationsDetector)
                 if class_name == 'nohelmet':
-                    if not person_data['violations']['no_helmet']:
-                        person_data['violations']['no_helmet'] = True
-                        
-                        # Save to database
-                        save_violation(camera_id, class_name, detection['confidence'], bbox)
-                        
-                        # Update global stats
-                        global_stats['no_helmet_count'] += 1
-                        global_stats['total_violations'] += 1
+                    person_data['violation_counters']['nohelmet'] += 1
+                elif class_name == 'novest':
+                    person_data['violation_counters']['novest'] += 1
+                
+                # Logika Logging berdasarkan counter
+                STABILIZER_THRESHOLD = 10 # 10 frame berturut-turut (~1 detik)
+                
+                if class_name == 'nohelmet':
+                    if person_data['violation_counters']['nohelmet'] >= STABILIZER_THRESHOLD:
+                        if not person_data['violations']['no_helmet']:
+                            person_data['violations']['no_helmet'] = True
+                            
+                            # COOLDOWN CHECK PER WORKER_ID
+                            w_id = person_data['worker_id']
+                            current_ts = time.time()
+                            last_vio = worker_cooldowns.get(w_id, 0)
+                            
+                            if current_ts - last_vio >= COOLDOWN_SECONDS:
+                                save_violation(camera_id, class_name, detection['confidence'], bbox, w_id)
+                                worker_cooldowns[w_id] = current_ts # Update cooldown
+                                global_stats['no_helmet_count'] += 1
+                                global_stats['total_violations'] += 1
+                            else:
+                                remaining = int(COOLDOWN_SECONDS - (current_ts - last_vio))
+                                if remaining > 0:
+                                    print(f"⏳ Cooldown active for {w_id} ({remaining}s remaining)")
                 
                 elif class_name == 'novest':
-                    if not person_data['violations']['no_vest']:
-                        person_data['violations']['no_vest'] = True
-                        
-                        # Save to database
-                        save_violation(camera_id, class_name, detection['confidence'], bbox)
-                        
-                        # Update global stats
-                        global_stats['no_vest_count'] += 1
-                        global_stats['total_violations'] += 1
+                    if person_data['violation_counters']['novest'] >= STABILIZER_THRESHOLD:
+                        if not person_data['violations']['no_vest']:
+                            person_data['violations']['no_vest'] = True
+                            
+                            # COOLDOWN CHECK PER WORKER_ID
+                            w_id = person_data['worker_id']
+                            current_ts = time.time()
+                            last_vio = worker_cooldowns.get(w_id, 0)
+                            
+                            if current_ts - last_vio >= COOLDOWN_SECONDS:
+                                save_violation(camera_id, class_name, detection['confidence'], bbox, w_id)
+                                worker_cooldowns[w_id] = current_ts # Update cooldown
+                                global_stats['no_vest_count'] += 1
+                                global_stats['total_violations'] += 1
+                            else:
+                                remaining = int(COOLDOWN_SECONDS - (current_ts - last_vio))
+                                if remaining > 0:
+                                    print(f"⏳ Cooldown active for {w_id} ({remaining}s remaining)")
                 
                 # Update last seen time
                 person_data['last_seen'] = current_time
@@ -738,25 +910,30 @@ def monitor_camera(camera_id, cap):
                 camera_stats[camera_id]['fps'] = round(frame_count / elapsed, 1)
         
         # Clean up old persons (not seen for 30 seconds)
-        cleanup_time = current_time - 30
-        persons_to_remove = []
-        for pid, pdata in tracked_persons[camera_id].items():
-            if pdata['last_seen'] < cleanup_time:
-                persons_to_remove.append(pid)
-        
-        for pid in persons_to_remove:
-            del tracked_persons[camera_id][pid]
+        if camera_id in tracked_persons:
+            cleanup_time = current_time - 30
+            persons_to_remove = []
+            for pid, pdata in tracked_persons[camera_id].items():
+                if pdata['last_seen'] < cleanup_time:
+                    persons_to_remove.append(pid)
+            
+            for pid in persons_to_remove:
+                if camera_id in tracked_persons and pid in tracked_persons[camera_id]:
+                    del tracked_persons[camera_id][pid]
         
         time.sleep(0.03)
 
-def save_violation(camera_id, violation_type, confidence, bbox):
-    """Save violation to database"""
-    conn = sqlite3.connect('apd_monitoring.db')
+def save_violation(camera_id, violation_type, confidence, bbox, worker_id='Unknown'):
+    """Save violation to database including local timestamp and worker_id"""
+    from datetime import datetime
+    local_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('''
-        INSERT INTO violations (camera_id, violation_type, confidence, bbox) 
-        VALUES (?, ?, ?, ?)
-    ''', (camera_id, violation_type, confidence, str(bbox)))
+        INSERT INTO violations (camera_id, violation_type, confidence, bbox, worker_id, timestamp) 
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (camera_id, violation_type, confidence, str(bbox), worker_id or 'Unknown', local_time))
     conn.commit()
     conn.close()
 
@@ -844,176 +1021,141 @@ LOGIN_TEMPLATE = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>APD Monitoring - Login</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=Outfit:wght@400;700;800&display=swap" rel="stylesheet">
     <style>
+        :root {
+            --primary: #6366f1;
+            --primary-hover: #4f46e5;
+            --bg-slate-950: #020617;
+            --bg-slate-900: #0f172a;
+            --text-slate-400: #94a3b8;
+            --border-slate-700: #334155;
+            --radius: 12px;
+        }
+
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
-            font-family: 'Courier New', monospace;
-            background: #000;
+            font-family: 'Inter', sans-serif;
+            background: var(--bg-slate-950);
             height: 100vh;
             display: flex;
             align-items: center;
             justify-content: center;
             color: #fff;
+            overflow: hidden;
         }
-        .login-container {
-            background: #111;
-            padding: 60px 40px;
-            border: 2px solid #333;
-            width: 450px;
-            text-align: center;
+
+        .login-card {
+            background: var(--bg-slate-900);
+            border: 1px solid var(--border-slate-700);
+            width: 100%;
+            max-width: 400px;
+            padding: 40px;
+            border-radius: 20px;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
             position: relative;
+            z-index: 10;
         }
-        .login-container::before {
-            content: '';
-            position: absolute;
-            top: -2px;
-            left: -2px;
-            right: -2px;
-            bottom: -2px;
-            background: linear-gradient(45deg, #fff, #000, #fff);
-            z-index: -1;
-        }
+
         .login-header {
-            margin-bottom: 40px;
+            text-align: center;
+            margin-bottom: 32px;
         }
+
         .login-header h1 {
-            color: #fff;
-            font-size: 32px;
-            margin-bottom: 10px;
-            letter-spacing: 2px;
-            text-transform: uppercase;
-            font-weight: 700;
+            font-family: 'Outfit', sans-serif;
+            font-size: 28px;
+            font-weight: 800;
+            background: linear-gradient(135deg, #fff 0%, #a5b4fc 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 8px;
         }
+
         .login-header p {
-            color: #888;
+            color: var(--text-slate-400);
             font-size: 14px;
-            letter-spacing: 1px;
         }
-        .form-group {
-            margin-bottom: 25px;
-            text-align: left;
-        }
+
+        .form-group { margin-bottom: 24px; }
         .form-group label {
             display: block;
-            margin-bottom: 10px;
-            color: #fff;
-            font-weight: 700;
-            letter-spacing: 1px;
-            text-transform: uppercase;
-            font-size: 12px;
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-slate-400);
+            margin-bottom: 8px;
         }
+
         .form-group input {
             width: 100%;
-            padding: 15px;
-            background: #000;
-            border: 2px solid #333;
+            padding: 12px 16px;
+            background: rgba(30, 41, 59, 0.5);
+            border: 1px solid var(--border-slate-700);
+            border-radius: var(--radius);
             color: #fff;
-            font-family: 'Courier New', monospace;
             font-size: 14px;
-            transition: all 0.3s ease;
+            transition: all 0.2s ease;
         }
+
         .form-group input:focus {
             outline: none;
-            border-color: #fff;
-            background: #111;
-            box-shadow: 0 0 10px rgba(255,255,255,0.1);
+            border-color: var(--primary);
+            box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.1);
         }
-        .form-group input::placeholder {
-            color: #555;
-        }
+
         .login-btn {
             width: 100%;
-            padding: 18px;
-            background: #000;
+            padding: 12px;
+            background: var(--primary);
             color: #fff;
-            border: 2px solid #fff;
-            font-family: 'Courier New', monospace;
-            font-size: 14px;
+            border: none;
+            border-radius: var(--radius);
+            font-size: 15px;
             font-weight: 700;
             cursor: pointer;
-            transition: all 0.3s ease;
-            text-transform: uppercase;
-            letter-spacing: 2px;
+            transition: all 0.2s ease;
+            margin-top: 8px;
         }
+
         .login-btn:hover {
-            background: #fff;
-            color: #000;
-            border-color: #fff;
+            background: var(--primary-hover);
+            transform: translateY(-1px);
         }
+
         .error-message {
-            background: #000;
-            color: #ff0000;
+            background: rgba(239, 68, 68, 0.1);
+            color: #f87171;
             padding: 12px;
-            border: 2px solid #ff0000;
-            margin-bottom: 25px;
-            font-size: 12px;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            font-weight: 600;
+            border-radius: 8px;
+            border: 1px solid rgba(239, 68, 68, 0.2);
+            margin-bottom: 24px;
+            font-size: 13px;
+            text-align: center;
         }
-        .scan-line {
+
+        /* Abstract Background */
+        .bg-glow {
             position: absolute;
-            width: 100%;
-            height: 1px;
-            background: #fff;
-            top: 0;
-            left: 0;
-            animation: scan 3s linear infinite;
-            opacity: 0.1;
-        }
-        @keyframes scan {
-            0% { top: 0; }
-            100% { top: 100%; }
-        }
-        .corner {
-            position: absolute;
-            width: 20px;
-            height: 20px;
-            border: 2px solid #fff;
-        }
-        .corner-tl {
-            top: 10px;
-            left: 10px;
-            border-right: none;
-            border-bottom: none;
-        }
-        .corner-tr {
-            top: 10px;
-            right: 10px;
-            border-left: none;
-            border-bottom: none;
-        }
-        .corner-bl {
-            bottom: 10px;
-            left: 10px;
-            border-right: none;
-            border-top: none;
-        }
-        .corner-br {
-            bottom: 10px;
-            right: 10px;
-            border-left: none;
-            border-top: none;
+            width: 500px;
+            height: 500px;
+            background: radial-gradient(circle, rgba(99, 102, 241, 0.1) 0%, rgba(99, 102, 241, 0) 70%);
+            z-index: 1;
+            pointer-events: none;
         }
     </style>
 </head>
 <body>
-    <div class="scan-line"></div>
-    <div class="login-container">
-        <div class="corner corner-tl"></div>
-        <div class="corner corner-tr"></div>
-        <div class="corner corner-bl"></div>
-        <div class="corner corner-br"></div>
-        
+    <div class="bg-glow"></div>
+    <div class="login-card">
         <div class="login-header">
-            <h1>APD MONITORING</h1>
-            <p>System Access Required</p>
+            <h1>NYAWANG</h1>
+            <p>Sistem Monitoring Pelanggaran APD</p>
         </div>
         
         {% with messages = get_flashed_messages() %}
             {% if messages %}
                 {% for message in messages %}
-                    <div class="error-message">ERROR: {{ message }}</div>
+                    <div class="error-message">Error: {{ message }}</div>
                 {% endfor %}
             {% endif %}
         {% endwith %}
@@ -1021,13 +1163,13 @@ LOGIN_TEMPLATE = """
         <form method="POST" action="/login">
             <div class="form-group">
                 <label for="username">Username</label>
-                <input type="text" id="username" name="username" placeholder="Enter Username" required>
+                <input type="text" id="username" name="username" placeholder="admin" required autofocus>
             </div>
             <div class="form-group">
                 <label for="password">Password</label>
-                <input type="password" id="password" name="password" placeholder="Enter Password" required>
+                <input type="password" id="password" name="password" placeholder="••••••••" required>
             </div>
-            <button type="submit" class="login-btn">Access System</button>
+            <button type="submit" class="login-btn">Sign In to Dashboard</button>
         </form>
     </div>
 </body>
@@ -1041,1041 +1183,1072 @@ DASHBOARD_TEMPLATE = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>APD Monitoring Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=Outfit:wght@400;700;800&display=swap" rel="stylesheet">
     <style>
+        :root {
+            --primary: #6366f1;
+            --primary-hover: #4f46e5;
+            --bg-slate-950: #020617;
+            --bg-slate-900: #0f172a;
+            --bg-slate-800: #1e293b;
+            --text-slate-50: #f8fafc;
+            --text-slate-300: #cbd5e1;
+            --text-slate-400: #94a3b8;
+            --border-slate-700: #334155;
+            --sidebar-width: 260px;
+            --header-height: 72px;
+            --radius: 12px;
+            --radius-lg: 16px;
+            --glass-bg: rgba(30, 41, 59, 0.7);
+            --glass-border: rgba(255, 255, 255, 0.05);
+        }
+
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { 
-            font-family: 'Courier New', monospace;
-            background: #000;
-            color: #fff;
+            font-family: 'Inter', sans-serif;
+            background: var(--bg-slate-950);
+            color: var(--text-slate-50);
+            line-height: 1.6;
+            overflow-x: hidden;
+            -webkit-font-smoothing: antialiased;
         }
-        
-        /* Header */
-        .header {
-            background: #111;
-            padding: 15px 30px;
-            border-bottom: 2px solid #333;
+
+        /* Modern Dashboard Layout */
+        .app-wrapper {
             display: flex;
-            justify-content: space-between;
-            align-items: center;
-            gap: 20px;
+            min-height: 100vh;
         }
-        .header h1 {
-            color: #fff;
-            font-size: 24px;
-            font-weight: 700;
-            letter-spacing: 2px;
-            text-transform: uppercase;
+
+        /* Sidebar Styling */
+        .sidebar {
+            width: var(--sidebar-width);
+            background: var(--bg-slate-900);
+            border-right: 1px solid var(--border-slate-700);
+            display: flex;
+            flex-direction: column;
+            position: fixed;
+            height: 100vh;
+            z-index: 100;
+            transition: all 0.3s ease;
         }
-        .header-left {
+
+        .sidebar-brand {
+            height: var(--header-height);
             display: flex;
             align-items: center;
-            gap: 20px;
-            flex-wrap: wrap;
+            padding: 0 24px;
+            border-bottom: 1px solid var(--border-slate-700);
         }
-        .header-camera-form {
+
+        .sidebar-brand h1 {
+            font-family: 'Outfit', sans-serif;
+            font-size: 20px;
+            font-weight: 800;
+            letter-spacing: -0.5px;
+            background: linear-gradient(135deg, #fff 0%, #a5b4fc 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .nav-menu {
+            padding: 24px 16px;
+            flex-grow: 1;
             display: flex;
-            align-items: center;
+            flex-direction: column;
             gap: 8px;
-            flex-wrap: wrap;
-            max-width: 800px;
         }
-        .header-camera-form input,
-        .header-camera-form select {
-            padding: 6px 8px;
-            font-size: 11px;
-            border-radius: 3px;
-            border: 1px solid #333;
-            background: #000;
-            color: #fff;
-            min-width: 120px;
-        }
-        .header-camera-form button {
-            padding: 6px 10px;
-            font-size: 11px;
-            border-radius: 3px;
-            min-width: 60px;
-        }
-        .header-camera-extra {
+
+        .nav-item {
             display: flex;
             align-items: center;
-            gap: 6px;
-            flex-wrap: wrap;
+            padding: 12px 16px;
+            border-radius: var(--radius);
+            color: var(--text-slate-400);
+            text-decoration: none;
+            font-weight: 600;
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+            gap: 12px;
         }
-        .user-info {
+
+        .nav-item:hover {
+            background: rgba(255, 255, 255, 0.03);
+            color: #fff;
+        }
+
+        .nav-item.active {
+            background: rgba(99, 102, 241, 0.1);
+            color: var(--primary);
+            box-shadow: inset 0 0 0 1px rgba(99, 102, 241, 0.2);
+        }
+
+        .nav-item .icon {
+            font-size: 18px;
+            width: 24px;
+            text-align: center;
+        }
+
+        /* Main Content Styling */
+        .main-container {
+            flex-grow: 1;
+            margin-left: var(--sidebar-width);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .header {
+            height: var(--header-height);
+            background: var(--bg-slate-900);
+            border-bottom: 1px solid var(--border-slate-700);
             display: flex;
             align-items: center;
-            gap: 15px;
+            justify-content: space-between;
+            padding: 0 32px;
+            position: sticky;
+            top: 0;
+            z-index: 90;
+            backdrop-filter: blur(12px);
         }
-        .logout-btn {
-            background: #000;
-            color: #fff;
+
+        .header-title {
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--text-slate-400);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .header-actions {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .btn-action {
             padding: 8px 16px;
-            border: 2px solid #fff;
-            font-family: 'Courier New', monospace;
+            border-radius: 8px;
+            background: var(--bg-slate-800);
+            border: 1px solid var(--border-slate-700);
+            color: var(--text-slate-300);
+            font-size: 13px;
             font-weight: 600;
             cursor: pointer;
-            text-decoration: none;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            transition: all 0.3s ease;
-        }
-        .logout-btn:hover {
-            background: #fff;
-            color: #000;
-        }
-        
-        /* Layout with Sidebar Navigation */
-        .layout-main {
-            display: flex;
-            min-height: calc(100vh - 70px);
-        }
-        .sidebar {
-            width: 140px; /* reduce from 220px */
-            background: #111;
-            border-right: 2px solid #333;
-            padding-top: 10px;
-        }
-        .nav-tabs {
-            display: flex;
-            flex-direction: column;
-            gap: 5px;
-        }
-        .nav-tab {
-            padding: 10px 12px; /* reduce padding */
-            cursor: pointer;
-            border-left: 3px solid transparent;
-            color: #888;
-            font-weight: 700;
-            text-transform: uppercase;
-            letter-spacing: 0.5px; /* reduce letter spacing */
-            transition: all 0.3s ease;
-            font-size: 12px; /* smaller font */
-        }
-        .nav-tab.active {
-            color: #fff;
-            border-left-color: #fff;
-            background: #000;
-        }
-        .nav-tab:hover {
-            color: #fff;
-            background: #000;
-        }
-        .content-area {
-            flex: 1;
-            background: #000;
-            min-height: calc(100vh - 120px); /* Ensure minimum height */
-        }
-        
-        /* Container */
-        .container { 
-            max-width: 100%; /* use full available width */
-            margin: 0 auto; 
-            padding: 10px 15px; /* reduce padding */
-            background: #000;
-            min-height: calc(100vh - 120px); /* Ensure minimum height */
-        }
-        
-        /* Tab Content */
-        .tab-content {
-            display: none;
-            min-height: 400px; /* Ensure minimum height */
-        }
-        .tab-content.active {
-            display: block;
-        }
-        
-        /* Camera Grid */
-        .camera-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(450px, 1fr));
-            gap: 25px;
-            margin-bottom: 30px;
-            align-items: start; /* Start from top, don't stretch */
-            padding: 10px;
-            min-height: 300px; /* Ensure minimum height so it's visible */
-            background: #000; /* Ensure background is visible */
-        }
-        
-        /* Responsive Grid */
-        @media (max-width: 1400px) {
-            .camera-grid {
-                grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
-                gap: 20px;
-                padding: 8px;
-            }
-        }
-        
-        @media (max-width: 1200px) {
-            .camera-grid {
-                grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
-                gap: 18px;
-                padding: 6px;
-            }
-        }
-        
-        @media (max-width: 900px) {
-            .camera-grid {
-                grid-template-columns: repeat(2, 1fr);
-                gap: 15px;
-                padding: 5px;
-            }
-        }
-        
-        @media (max-width: 768px) {
-            .camera-grid {
-                grid-template-columns: 1fr;
-                gap: 15px;
-                padding: 5px;
-            }
-        }
-        
-        .view-mode-bar {
-            display: flex;
-            align-items: center;
-            justify-content: flex-end;
-            gap: 10px;
-            margin-bottom: 15px;
-            color: #888;
-            font-size: 12px;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-        }
-        .view-mode-bar select {
-            background: #000;
-            color: #fff;
-            border: 1px solid #333;
-            padding: 4px 6px;
-            font-size: 12px;
-        }
-        .camera-card {
-            background: #111;
-            border: 2px solid #333;
-            padding: 20px;
-            position: relative;
-            display: flex;
-            flex-direction: column;
-            min-height: 0; /* Allow flex items to shrink */
-            box-sizing: border-box;
-            width: 100%;
-            max-width: 100%;
-            overflow: hidden;
-        }
-        .camera-card::before {
-            content: '';
-            position: absolute;
-            top: -2px;
-            left: -2px;
-            right: -2px;
-            bottom: -2px;
-            background: linear-gradient(45deg, #fff, #000, #fff);
-            z-index: -1;
-        }
-        .camera-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 8px;
-        }
-        .camera-title {
-            font-size: 18px;
-            font-weight: 700;
-            color: #fff;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-        }
-        .camera-status {
+            transition: all 0.2s ease;
             display: flex;
             align-items: center;
             gap: 8px;
+            text-decoration: none;
         }
-        .status-dot {
-            width: 10px;
-            height: 10px;
-            border-radius: 50%;
-            background: #ff0000;
+
+        .btn-action:hover {
+            background: var(--border-slate-700);
+            color: #fff;
         }
-        .status-dot.active {
-            background: #00ff00;
+
+        .btn-primary {
+            background: var(--primary);
+            border: none;
+            color: #fff;
         }
-        .status-text {
-            color: #888;
-            font-size: 12px;
-            text-transform: uppercase;
-            letter-spacing: 1px;
+
+        .btn-primary:hover {
+            background: var(--primary-hover);
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
         }
-        .video-container {
-            position: relative;
-            background: #000;
-            border: 1px solid #333;
+
+        /* Dashboard Grid & Cards */
+        .content-body {
+            padding: 32px;
+            flex-grow: 1;
+        }
+
+        .card {
+            background: var(--bg-slate-900);
+            border: 1px solid var(--border-slate-700);
+            border-radius: var(--radius-lg);
+            padding: 24px;
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
             overflow: hidden;
-            /* Consistent aspect ratio for all cards */
-            aspect-ratio: 16 / 9;
-            width: 100%;
-            min-height: 0; /* Allow flex shrink */
+        }
+
+        .card-header {
+            margin-bottom: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .card-title {
+            font-size: 16px;
+            font-weight: 700;
+            color: #fff;
             display: flex;
             align-items: center;
-            justify-content: center;
-            flex-shrink: 0;
+            gap: 10px;
         }
+
+        /* Camera Grid Specifics */
+        .camera-grid {
+            display: grid;
+            gap: 24px;
+            margin-top: 24px;
+        }
+
+        .video-container {
+            aspect-ratio: 16/9;
+            background: #000;
+            border-radius: 8px;
+            overflow: hidden;
+            position: relative;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+        }
+
         .video-feed {
             width: 100%;
             height: 100%;
-            object-fit: cover;
+            object-fit: contain;
+        }
+
+        /* Circular Chart Styles */
+        .flex-center-center {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .circular-chart {
             display: block;
+            margin: 10px auto;
+            max-width: 151px;
+            max-height: 151px;
         }
-        .camera-controls {
-            display: flex;
-            gap: 10px;
-            margin-top: 15px;
-            flex: 0 0 auto;
-            align-items: stretch;
-            width: 100%;
-            box-sizing: border-box;
+
+        .circle-bg {
+            fill: none;
+            stroke: var(--bg-slate-800);
+            stroke-width: 2.8;
         }
-        .control-btn {
-            flex: 1; /* equal 1/4 width each */
-            padding: 10px;
-            border: 2px solid #fff;
-            font-family: 'Courier New', monospace;
-            font-size: 14px;
-            font-weight: 700;
-            cursor: pointer;
-            transition: all 0.2s ease;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            background: #000;
-            color: #fff;
-            box-sizing: border-box;
-            text-align: center;
-            white-space: nowrap;
-            min-height: 40px;
-            overflow: hidden; /* clip button text if too long */
+
+        .circle {
+            fill: none;
+            stroke-width: 2.8;
+            stroke-linecap: round;
+            transition: stroke-dashoffset 1s ease-in-out;
         }
-        .control-btn.start {
-            border-color: #ffffff;
-            color: #ffffff;
-        }
-        .control-btn.start:hover {
-            background: #ffffff;
-            color: #000;
-        }
-        .control-btn.stop {
-            border-color: #ff0000;
-            color: #ff0000;
-        }
-        .control-btn.stop:hover {
-            background: #ff0000;
-            color: #000;
-        }
-        .control-btn:hover {
-            transform: translateY(-2px);
-        }
-        /* reduce hover lift to avoid overlapping nearby cards */
-        .control-btn:active, .control-btn:focus {
-            transform: none;
-        }
-        .camera-info {
-            margin-top: 15px;
-            padding: 10px;
-            background: #000;
-            border: 1px solid #333;
-            flex: 0 0 auto;
-            overflow: hidden;
-            width: 100%;
-            max-width: 100%; /* ensure info box doesn't overflow card */
-            box-sizing: border-box;
-        }
-        .info-text {
-            color: #888;
-            font-size: 10px; /* smaller font to fit more */
-            font-family: 'Courier New', monospace;
-            text-transform: uppercase;
-            letter-spacing: 0.5px; /* reduce letter spacing */
-            margin-bottom: 3px;
-            word-wrap: break-word; /* wrap long text */
-            overflow-wrap: break-word; /* modern wrap */
-            word-break: break-all; /* break very long words/urls */
-            width: 100%;
-            box-sizing: border-box;
-        }
-        .info-text:last-child {
-            margin-bottom: 0;
-        }
-        
-        /* Per-mode grid settings (heights handled by flex, not min-height) */
-        
-        /* Compact mode for 8 cameras */
-        .view-mode-8 .camera-grid {
-            gap: 12px;
-            padding: 8px;
-            grid-template-columns: repeat(4, 1fr) !important; /* Force 4 columns */
-        }
-        .view-mode-8 .camera-card {
-            padding: 12px;
-        }
-        .view-mode-8 .camera-title {
-            font-size: 14px;
-        }
-        .view-mode-8 .status-text {
-            font-size: 10px;
-        }
-        .view-mode-8 .camera-header {
-            margin-bottom: 6px;
-        }
-        .view-mode-8 .camera-controls {
-            gap: 6px;
-            margin-top: 10px;
-        }
-        .view-mode-8 .control-btn {
-            padding: 6px 4px;
-            font-size: 10px;
-            letter-spacing: 0.5px;
-            min-height: 32px;
-        }
-        .view-mode-8 .camera-info {
-            margin-top: 10px;
-            padding: 6px;
-        }
-        .view-mode-8 .info-text {
-            font-size: 9px;
-            margin-bottom: 2px;
-        }
-        
-        /* Compact mode for 16 cameras */
-        .view-mode-16 .camera-grid {
-            gap: 8px;
-            padding: 6px;
-            grid-template-columns: repeat(4, 1fr) !important; /* Force 4 columns */
-        }
-        .view-mode-16 .camera-card {
-            padding: 8px;
-        }
-        .view-mode-16 .camera-title {
-            font-size: 12px;
-        }
-        .view-mode-16 .status-text {
-            font-size: 9px;
-        }
-        .view-mode-16 .status-dot {
-            width: 8px;
-            height: 8px;
-        }
-        .view-mode-16 .camera-header {
-            margin-bottom: 4px;
-        }
-        .view-mode-16 .camera-controls {
-            gap: 4px;
-            margin-top: 8px;
-        }
-        .view-mode-16 .control-btn {
-            padding: 4px 2px;
-            font-size: 9px;
-            letter-spacing: 0px;
-            min-height: 28px;
-        }
-        .view-mode-16 .camera-info {
-            margin-top: 8px;
-            padding: 4px;
-        }
-        .view-mode-16 .info-text {
-            font-size: 8px;
-            margin-bottom: 1px;
-        }
-        
-        /* Sub-navigation inside tabs */
-        .sub-nav {
-            display: flex;
-            gap: 20px;
-            margin-bottom: 25px;
-            border-bottom: 1px solid #333;
-            padding-bottom: 15px;
-        }
-        .sub-nav-item {
-            color: #888;
-            font-size: 13px;
-            font-weight: 700;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            cursor: pointer;
-            transition: all 0.3s ease;
+
+        .chart-container {
             position: relative;
+            width: 150px;
+            height: 150px;
+            margin: 0 auto;
         }
-        .sub-nav-item.active {
-            color: #fff;
-        }
-        .sub-nav-item.active::after {
-            content: '';
+
+        .percentage {
             position: absolute;
-            bottom: -16px;
-            left: 0;
-            width: 100%;
-            height: 2px;
-            background: #fff;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-family: 'Outfit', sans-serif;
+            font-size: 24px;
+            font-weight: 800;
+            color: var(--text-slate-50);
         }
-        .sub-section {
-            display: none;
+
+        .status-badge {
+            padding: 4px 10px;
+            border-radius: 100px;
+            font-size: 10px;
+            font-weight: 800;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            background: rgba(16, 185, 129, 0.1);
+            color: #10b981;
+            border: 1px solid rgba(16, 185, 129, 0.2);
         }
-        .sub-section.active {
-            display: block;
+
+        .status-badge.offline {
+            background: rgba(239, 68, 68, 0.1);
+            color: #ef4444;
+            border: 1px solid rgba(239, 68, 68, 0.2);
         }
+
+        /* Stats Dashboard Styling */
         .stats-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
             gap: 20px;
-            margin-bottom: 20px;
+            margin-bottom: 32px;
         }
+
         .stat-card {
-            background: #111;
-            border: 2px solid #333;
-            padding: 20px;
-            text-align: center;
-            position: relative;
+            background: var(--bg-slate-900);
+            border: 1px solid var(--border-slate-700);
+            padding: 24px;
+            border-radius: var(--radius);
         }
-        .stat-card::before {
-            content: '';
-            position: absolute;
-            top: -2px;
-            left: -2px;
-            right: -2px;
-            bottom: -2px;
-            background: linear-gradient(45deg, #fff, #000, #fff);
-            z-index: -1;
-        }
-        .stat-value {
-            font-size: 36px;
-            font-weight: 700;
-            color: #fff;
-            margin-bottom: 10px;
-            text-transform: uppercase;
-            letter-spacing: 2px;
-        }
+
         .stat-label {
-            color: #888;
-            font-size: 14px;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-        }
-        
-        /* Violations Table */
-        .violations-table {
-            background: #111;
-            border: 2px solid #333;
-            padding: 20px;
-            position: relative;
-        }
-        .violations-table::before {
-            content: '';
-            position: absolute;
-            top: -2px;
-            left: -2px;
-            right: -2px;
-            bottom: -2px;
-            background: linear-gradient(45deg, #fff, #000, #fff);
-            z-index: -1;
-        }
-        .table-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 20px;
-        }
-        .table-title {
-            font-size: 18px;
+            color: var(--text-slate-400);
+            font-size: 12px;
             font-weight: 700;
-            color: #fff;
             text-transform: uppercase;
             letter-spacing: 1px;
+            margin-bottom: 8px;
         }
-        .export-btn {
-            background: #000;
-            color: #fff;
-            padding: 8px 16px;
-            border: 2px solid #fff;
-            font-family: 'Courier New', monospace;
-            font-weight: 600;
-            cursor: pointer;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            transition: all 0.3s ease;
+
+        .stat-value {
+            font-family: 'Outfit', sans-serif;
+            font-size: 32px;
+            font-weight: 800;
+            color: var(--text-slate-50);
         }
-        .export-btn:hover {
-            background: #fff;
-            color: #000;
+
+        /* Table Modernization */
+        .table-container {
+            background: var(--bg-slate-900);
+            border: 1px solid var(--border-slate-700);
+            border-radius: var(--radius-lg);
+            overflow: hidden;
         }
+
         table {
             width: 100%;
             border-collapse: collapse;
-        }
-        th, td {
-            padding: 12px;
             text-align: left;
-            border-bottom: 1px solid #333;
-            font-family: 'Courier New', monospace;
         }
+
         th {
-            background: #000;
+            background: rgba(255, 255, 255, 0.02);
+            padding: 16px 24px;
+            font-size: 12px;
             font-weight: 700;
-            color: #fff;
+            color: var(--text-slate-400);
             text-transform: uppercase;
             letter-spacing: 1px;
+            border-bottom: 1px solid var(--border-slate-700);
         }
+
         td {
-            color: #fff;
+            padding: 16px 24px;
+            font-size: 13px;
+            color: var(--text-slate-300);
+            border-bottom: 1px solid var(--border-slate-700);
         }
-        .violation-badge {
-            padding: 4px 8px;
-            border-radius: 12px;
-            font-size: 12px;
-            font-weight: 600;
-            color: #000;
-            text-transform: uppercase;
-            letter-spacing: 1px;
+
+        tr:last-child td { border-bottom: none; }
+
+        tr:hover td { background: rgba(255, 255, 255, 0.01); }
+
+        /* Tab Content Display Logic */
+        .tab-content {
+            display: none !important;
+            animation: fadeIn 0.3s ease;
         }
-        .violation-badge.nohelmet {
-            background: #ff0000;
+        .tab-content.active {
+            display: block !important;
         }
-        .violation-badge.novest {
-            background: #ffaa00;
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(4px); }
+            to { opacity: 1; transform: translateY(0); }
         }
-        
-        /* Daily Stats Chart */
-        .stats-section {
-            margin-bottom: 30px;
-        }
-        .date-filter {
-            display: flex;
-            align-items: center;
-            gap: 15px;
-            margin-bottom: 20px;
-            padding: 15px;
-            background: #111;
-            border: 1px solid #333;
-        }
-        .date-filter label {
-            color: #fff;
-            font-weight: 600;
-        }
-        .date-filter input {
-            padding: 8px;
-            background: #000;
-            border: 1px solid #333;
-            color: #fff;
-        }
-        .chart-container {
-            background: #111;
-            border: 1px solid #333;
-            padding: 20px;
-            border-radius: 8px;
-        }
-        .export-options {
-            display: flex;
-            gap: 10px;
-        }
-        .export-options .export-btn {
-            padding: 8px 16px;
-            font-size: 12px;
-        }
-        
-        /* Add Camera Modal */
+
+        /* Modal Refinement */
         .modal {
             display: none;
             position: fixed;
-            z-index: 1000;
-            left: 0;
-            top: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0,0,0,0.8);
+            inset: 0;
+            background: rgba(2, 6, 23, 0.7);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            z-index: 2000;
+            align-items: center;
+            justify-content: center;
+            opacity: 0;
+            transition: opacity 0.3s ease;
+        }
+        .modal.active {
+            display: flex;
+            opacity: 1;
         }
         .modal-content {
-            background: #111;
-            border: 2px solid #fff;
-            margin: 10% auto;
-            padding: 30px;
-            width: 400px;
-            position: relative;
+            background: linear-gradient(135deg, rgba(30, 41, 59, 0.8), rgba(15, 23, 42, 0.9));
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 24px;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+            width: 95%;
+            max-width: 550px;
+            padding: 32px;
+            transform: scale(0.95);
+            transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
         }
-        .modal-content::before {
-            content: '';
-            position: absolute;
-            top: -2px;
-            left: -2px;
-            right: -2px;
-            bottom: -2px;
-            background: linear-gradient(45deg, #fff, #000, #fff);
-            z-index: -1;
+        .modal.active .modal-content {
+            transform: scale(1);
         }
-        .form-group {
-            margin-bottom: 20px;
+
+        /* Camera Registration Specific UI */
+        #registration-video {
+            border: 2px solid var(--primary);
+            box-shadow: 0 0 20px rgba(99, 102, 241, 0.3);
+            border-radius: 16px;
         }
+        #face-guide-box {
+            border: 2px dashed rgba(255, 255, 255, 0.5);
+            box-shadow: 0 0 0 5000px rgba(0, 0, 0, 0.4);
+        }
+        #capture-instruction {
+            font-family: 'Outfit';
+            font-size: 16px;
+            letter-spacing: 0.5px;
+            animation: pulse-ui 1.5s infinite;
+        }
+        @keyframes pulse-ui {
+            0% { transform: scale(1); opacity: 1; }
+            50% { transform: scale(1.05); opacity: 0.8; }
+            100% { transform: scale(1); opacity: 1; }
+        }
+
+        .form-group { margin-bottom: 20px; }
         .form-group label {
             display: block;
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-slate-400);
             margin-bottom: 8px;
-            color: #fff;
-            font-weight: 700;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            font-size: 12px;
         }
         .form-group input, .form-group select {
             width: 100%;
-            padding: 10px;
-            background: #000;
-            border: 2px solid #333;
-            color: #fff;
-            font-family: 'Courier New', monospace;
+            padding: 10px 14px;
+            background: var(--bg-slate-800);
+            border: 1px solid var(--border-slate-700);
+            border-radius: 8px;
+            color: var(--text-slate-50);
+            font-size: 14px;
+            transition: all 0.2s ease;
         }
         .form-group input:focus, .form-group select:focus {
             outline: none;
-            border-color: #fff;
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
         }
-        .modal-buttons {
+
+        /* Sub-navigation for Workers */
+        .sub-section { display: none; }
+        .sub-section.active { display: block; }
+
+        /* Modal Sidebar Submenu Styles */
+        .nav-group {
             display: flex;
-            gap: 10px;
+            flex-direction: column;
+        }
+
+        /* Modal Popup Styles */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.7);
+            backdrop-filter: blur(4px);
+            z-index: 1000;
+            justify-content: center;
+            align-items: center;
+            opacity: 0;
+            transition: opacity 0.3s ease;
+        }
+        .modal-overlay.active {
+            display: flex;
+            opacity: 1;
+        }
+        .modal-content {
+            background: var(--bg-slate-900);
+            border: 1px solid var(--border-slate-700);
+            border-radius: 16px;
+            width: 90%;
+            max-width: 450px;
+            padding: 32px;
+            transform: scale(0.9);
+            transition: transform 0.3s ease;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+        }
+        .modal-overlay.active .modal-content {
+            transform: scale(1);
+        }
+        .modal-header {
+            margin-bottom: 24px;
+            text-align: center;
+        }
+        .modal-title {
+            font-size: 20px;
+            font-weight: 800;
+            color: #fff;
+            font-family: 'Outfit';
+        }
+        .modal-body {
+            margin-bottom: 32px;
+        }
+        .modal-footer {
+            display: flex;
+            gap: 12px;
             justify-content: flex-end;
         }
-        .btn {
-            padding: 10px 20px;
+        .submenu {
+            display: none;
+            padding-left: 36px;
+            margin-top: 4px;
+            flex-direction: column;
+            gap: 4px;
+        }
+        .submenu.active {
+            display: flex;
+        }
+        .submenu-item {
+            padding: 8px 16px;
+            border-radius: 8px;
+            color: var(--text-slate-400);
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            text-decoration: none;
+        }
+        .submenu-item:hover {
+            color: #fff;
+            background: rgba(255, 255, 255, 0.03);
+        }
+        .submenu-item.active {
+            color: var(--primary);
+        }
+        .nav-item .arrow {
+            margin-left: auto;
+            font-size: 10px;
+            transition: transform 0.3s ease;
+        }
+        .nav-item.expanded .arrow {
+            transform: rotate(180deg);
+        }
+
+        /* Modern Light Mode */
+        body.light-mode {
+            --bg-slate-950: #f8fafc;
+            --bg-slate-900: #ffffff;
+            --bg-slate-800: #f1f5f9;
+            --text-slate-50: #0f172a;
+            --text-slate-400: #64748b;
+            --text-slate-300: #1e293b;
+            --border-slate-700: #e2e8f0;
+            --glass-bg: rgba(255, 255, 255, 0.8);
+        }
+        body.light-mode .sidebar { background: #fff; }
+        body.light-mode .nav-item:hover { background: #f1f5f9; }
+        body.light-mode .card, body.light-mode .stat-card { box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        body.light-mode .sidebar-brand h1 { background: var(--primary); -webkit-background-clip: text; }
+        body.light-mode input, body.light-mode select { color: var(--text-slate-50); }
+        body.light-mode .stat-value, body.light-mode .percentage { color: var(--text-slate-50); }
+
+        /* Custom Header Button */
+        .add-camera-btn {
+            background: #000;
+            color: #fff;
+            padding: 8px 16px;
             border: 2px solid #fff;
             font-family: 'Courier New', monospace;
-            font-weight: 600;
+            font-weight: 700;
             cursor: pointer;
             text-transform: uppercase;
             letter-spacing: 1px;
             transition: all 0.3s ease;
         }
-        .btn-primary {
-            background: #000;
-            color: #fff;
-        }
-        .btn-primary:hover {
+        .add-camera-btn:hover {
             background: #fff;
             color: #000;
-        }
-        .btn-secondary {
-            background: #333;
-            color: #fff;
-            border-color: #333;
-        }
-        .btn-secondary:hover {
-            background: #555;
-        }
-        
-        /* Scan line effect */
-        .scan-line {
-            position: fixed;
-            width: 100%;
-            height: 1px;
-            background: #fff;
-            top: 0;
-            left: 0;
-            animation: scan 3s linear infinite;
-            opacity: 0.05;
-            z-index: 1;
-            pointer-events: none;
-        }
-        @keyframes scan {
-            0% { top: 0; }
-            100% { top: 100%; }
-        }
-        .form-group label {
-            display: block;
-            margin-bottom: 8px;
-            color: #2c3e50;
-            font-weight: 600;
-        }
-        .form-group input, .form-group select {
-            width: 100%;
-            padding: 10px;
-            border: 1px solid #ddd;
-            border-radius: 5px;
-        }
-        .modal-buttons {
-            display: flex;
-            gap: 10px;
-            justify-content: flex-end;
-        }
-        .btn {
-            padding: 10px 20px;
-            border: none;
-            border-radius: 5px;
-            cursor: pointer;
-        }
-        .btn-primary {
-            background: #3498db;
-            color: white;
-        }
-        .btn-secondary {
-            background: #95a5a6;
-            color: white;
         }
     </style>
 </head>
 <body>
-    <div class="scan-line"></div>
-    <div class="header">
-        <div class="header-left">
-            <h1>APD MONITORING SYSTEM</h1>
-            <!-- Simple Camera CRUD in Header -->
-            <div class="header-camera-form">
-                <input type="text" id="camera-name" placeholder="Name">
-                <select id="camera-source" onchange="handleSourceChange()">
-                    <option value="">Source</option>
-                    <option value="0">Webcam 0</option>
-                    <option value="1">Webcam 1</option>
-                    <option value="2">Webcam 2</option>
-                    <option value="3">Webcam 3</option>
-                    <option value="rtsp://service:cctv@172.19.156.152/live.sdp">CCTV Main</option>
-                    <option value="rtsp://service:cctv@172.19.156.152:554/live.sdp">CCTV Main :554</option>
-                    <option value="rtsp">RTSP Custom</option>
-                    <option value="file">Video File</option>
-                </select>
-                <div class="header-camera-extra" id="rtsp-group" style="display:none;">
-                    <input type="text" id="rtsp-url" placeholder="rtsp://...">
-                    <button class="btn btn-secondary" type="button" onclick="testRtsp()">Test</button>
-                    <button class="btn btn-secondary" type="button" onclick="diagnoseRtsp()">Diagnose</button>
-                </div>
-                <div class="header-camera-extra" id="file-group" style="display:none;">
-                    <input type="text" id="file-path" placeholder="video.mp4">
-                </div>
-                <button class="btn btn-primary" type="button" onclick="addCamera()">Save</button>
-                <button class="btn btn-secondary" type="button" onclick="resetCameraForm()">Reset</button>
+    <div class="app-wrapper">
+        <!-- Sidebar Navigation -->
+        <aside class="sidebar">
+            <div class="sidebar-brand">
+                <h1>NYAWANG</h1>
             </div>
-        </div>
-        <div class="user-info">
-            <span>USER: {{ session.username }}</span>
-            <a href="/logout" class="logout-btn">Logout</a>
-        </div>
-    </div>
-    
-    <div class="layout-main">
-        <div class="sidebar">
-            <div class="nav-tabs">
-                <div class="nav-tab active" onclick="showTab('cameras')">Cameras</div>
-                <div class="nav-tab" onclick="showTab('workers')">Workers</div>
-                <div class="nav-tab" onclick="showTab('statistics')">Statistics</div>
-                <div class="nav-tab" onclick="showTab('violations')">Violations</div>
-                <div class="nav-tab" onclick="showTab('settings')">Settings</div>
+            <nav class="nav-menu">
+                <a class="nav-item active" onclick="showTab('cameras')" id="nav-cameras">
+                    <span class="icon">📹</span> Kamera
+                </a>
+                <a class="nav-item" onclick="showTab('statistics')" id="nav-statistics">
+                    <span class="icon">📊</span> Statistik
+                </a>
+                <a class="nav-item" onclick="showTab('violations')" id="nav-violations">
+                    <span class="icon">🚨</span> Pelanggaran
+                </a>
+                <div class="nav-group">
+                    <a class="nav-item" onclick="toggleSubmenu('workers')" id="nav-workers">
+                        <span class="icon">👥</span> Pekerja <span class="arrow">▼</span>
+                    </a>
+                    <div id="submenu-workers" class="submenu">
+                        <a class="submenu-item" onclick="switchToWorkerSection('list')" id="sub-list">Daftar Pekerja</a>
+                        <a class="submenu-item" onclick="switchToWorkerSection('register')" id="sub-register">Registrasi Baru</a>
+                        <a class="submenu-item" onclick="switchToWorkerSection('captures')" id="sub-captures">Dataset Capture</a>
+                    </div>
+                </div>
+                <a class="nav-item" onclick="showTab('settings')" id="nav-settings">
+                    <span class="icon">⚙️</span> Pengaturan
+                </a>
+            </nav>
+            <div style="padding: 24px; border-top: 1px solid var(--border-slate-700);">
+                <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 16px;">
+                    <div style="width: 32px; height: 32px; background: var(--primary); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 12px;">AD</div>
+                    <div style="overflow: hidden;">
+                        <p style="font-size: 13px; font-weight: 700; color: #fff; white-space: nowrap; text-overflow: ellipsis;">{{ session.username }}</p>
+                        <p style="font-size: 11px; color: var(--text-slate-400);">Administrator</p>
+                    </div>
+                </div>
+                <a href="/logout" class="btn-action" style="justify-content: center; color: #f87171; border-color: rgba(239, 68, 68, 0.1); background: rgba(239, 68, 68, 0.05); width: 100%;">
+                    <span>🚪</span> Sign Out
+                </a>
             </div>
-        </div>
-        <div class="content-area">
-            <div class="container">
+        </aside>
+
+        <!-- Main Content -->
+        <main class="main-container">
+            <header class="header">
+                <div>
+                    <h2 class="header-title" id="current-tab-title">Monitoring Kamera</h2>
+                </div>
+                <div class="header-actions">
+                    <button class="btn-action" onclick="toggleLightMode()" id="theme-btn">
+                        <span>💡</span> Mode Terang
+                    </button>
+                    <button class="btn-action btn-primary" onclick="openAddCameraModal()" id="main-add-btn">
+                        <span>+</span> Tambah Kamera
+                    </button>
+                </div>
+            </header>
+
+            <div class="content-body">
                 <!-- Cameras Tab -->
                 <div id="cameras" class="tab-content active">
-                    <div class="view-mode-bar">
-                        <span>View Mode</span>
-                        <select id="view-mode" onchange="changeViewMode()">
-                            <option value="1">1 Cam</option>
-                            <option value="2">2 Cam</option>
-                            <option value="4" selected>4 Cam</option>
-                            <option value="8">8 Cam</option>
-                            <option value="16">16 Cam</option>
-                        </select>
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;">
+                        <h3 style="font-size: 20px; font-family: 'Outfit'; font-weight: 800;">Overview Kamera</h3>
+                        <div class="form-group" style="margin-bottom: 0;">
+                            <select id="view-mode" onchange="changeViewMode()" style="padding: 8px 16px; min-width: 140px;">
+                                <option value="1">1 Kamera</option>
+                                <option value="2">2 Kamera</option>
+                                <option value="4" selected>4 Kamera</option>
+                                <option value="8">8 Kamera</option>
+                                <option value="16">16 Kamera</option>
+                                <option value="all">Semua Kamera</option>
+                            </select>
+                        </div>
                     </div>
                     <div class="camera-grid" id="camera-grid">
-                        <!-- Camera cards will be loaded here -->
+                        <!-- Camera cards loaded via JS -->
                     </div>
                 </div>
-                
+
+                <!-- Statistics Tab -->
+                <div id="statistics" class="tab-content">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;">
+                        <h3 style="font-size: 20px; font-family: 'Outfit'; font-weight: 800;">Analisis Statistik</h3>
+                        <div style="display: flex; gap: 12px; align-items: center;">
+                            <input type="date" id="start-date" onchange="updateDailyStats()" class="btn-action" style="padding: 8px;">
+                            <input type="date" id="end-date" onchange="updateDailyStats()" class="btn-action" style="padding: 8px;">
+                            <button class="btn-action" onclick="resetData()" style="color: #f87171; border-color: rgba(239,68,68,0.2); font-weight: 700; background: rgba(239,68,68,0.05);">Reset Data</button>
+                        </div>
+                    </div>
+
+                    <div class="stats-grid">
+                        <div class="stat-card">
+                            <p class="stat-label">Total Pelanggaran</p>
+                            <p class="stat-value" id="total-violations">0</p>
+                        </div>
+                        <div class="stat-card">
+                            <p class="stat-label">Tanpa Helm</p>
+                            <p class="stat-value" id="no-helmet-count" style="color: #f87171;">0</p>
+                        </div>
+                        <div class="stat-card">
+                            <p class="stat-label">Tanpa Rompi</p>
+                            <p class="stat-value" id="no-vest-count" style="color: #fbbf24;">0</p>
+                        </div>
+                        <div class="stat-card">
+                            <p class="stat-label">Status Sistem</p>
+                            <p class="stat-value" id="active-cameras" style="color: #10b981; font-size: 18px; margin-top: 12px;">Online</p>
+                        </div>
+                    </div>
+
+                    <div class="grid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 24px; margin-bottom: 24px;">
+                        <div class="card flex-center-center" style="padding: 32px 0;">
+                            <div>
+                                <h4 class="card-title" style="margin-bottom: 20px; text-align: center;">Akurasi Deteksi APD</h4>
+                                <div class="chart-container">
+                                    <svg viewBox="0 0 36 36" class="circular-chart">
+                                        <path class="circle-bg"
+                                            d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"
+                                        />
+                                        <path id="apd-circle" class="circle"
+                                            stroke="#6366f1"
+                                            stroke-dasharray="100, 100"
+                                            stroke-dashoffset="100"
+                                            d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"
+                                        />
+                                    </svg>
+                                    <div class="percentage" id="avg-apd-accuracy">0%</div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="card flex-center-center" style="padding: 32px 0;">
+                            <div>
+                                <h4 class="card-title" style="margin-bottom: 20px; text-align: center;">Akurasi Face Recognition</h4>
+                                <div class="chart-container">
+                                    <svg viewBox="0 0 36 36" class="circular-chart">
+                                        <path class="circle-bg"
+                                            d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"
+                                        />
+                                        <path id="face-circle" class="circle"
+                                            stroke="#10b981"
+                                            stroke-dasharray="100, 100"
+                                            stroke-dashoffset="100"
+                                            d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"
+                                        />
+                                    </svg>
+                                    <div class="percentage" id="avg-face-accuracy">0%</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header">
+                            <h4 class="card-title">Tren Pelanggaran Harian</h4>
+                            <p style="font-size: 12px; color: var(--text-slate-400);" id="last-update"></p>
+                        </div>
+                        <div style="height: 300px;">
+                            <canvas id="daily-chart"></canvas>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Violations Tab -->
+                <div id="violations" class="tab-content">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;">
+                        <h3 style="font-size: 20px; font-family: 'Outfit'; font-weight: 800;">Log Pelanggaran</h3>
+                        <div style="display: flex; gap: 12px;">
+                            <button class="btn-action" onclick="exportData('pdf')">PDF</button>
+                            <button class="btn-action" onclick="exportData('excel')">Excel</button>
+                        </div>
+                    </div>
+
+                    <div class="card" style="padding: 0;">
+                        <div style="padding: 20px; border-bottom: 1px solid var(--border-slate-700); display: flex; gap: 16px; align-items: center;">
+                            <span style="font-size: 13px; color: var(--text-slate-400);">Filter Tanggal:</span>
+                            <input type="date" id="violation-start-date" onchange="loadViolations()" class="btn-action" style="padding: 6px;">
+                            <span style="color: var(--text-slate-700);">→</span>
+                            <input type="date" id="violation-end-date" onchange="loadViolations()" class="btn-action" style="padding: 6px;">
+                        </div>
+                        <div class="table-container" style="border: none; border-radius: 0;">
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>Jam</th>
+                                        <th>Tanggal</th>
+                                        <th>Lokasi Kamera</th>
+                                        <th>Jenis Pelanggaran</th>
+                                        <th>Identitas Pekerja</th>
+                                        <th>Skor Akurasi</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="violations-tbody">
+                                    <!-- Loaded via JS -->
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Workers Tab -->
                 <div id="workers" class="tab-content">
-                    <div class="violations-table">
-                        <div class="table-header">
-                            <div class="table-title">👥 Manajemen Pekerja</div>
-                        </div>
-
-                        <!-- Sub-navbar -->
-                        <div class="sub-nav">
-                            <div class="sub-nav-item active" id="btn-list-worker" onclick="showWorkerSection('list')">List Workers</div>
-                            <div class="sub-nav-item" id="btn-register-worker" onclick="showWorkerSection('register')">Register New Worker</div>
-                        </div>
-
-                        <!-- User List Section -->
-                        <div id="worker-list-section" class="sub-section active">
+                    <h3 style="font-size: 20px; font-family: 'Outfit'; font-weight: 800; margin-bottom: 24px;">Manajemen Pekerja</h3>
+                    
+                    <div id="worker-list-section" class="sub-section active">
+                        <div class="table-container">
                             <table>
                                 <thead>
                                     <tr>
                                         <th>ID</th>
-                                        <th>Name</th>
-                                        <th>Images</th>
-                                        <th>Registered Date</th>
-                                        <th>Actions</th>
+                                        <th>Nama Lengkap</th>
+                                        <th>Sampel Wajah</th>
+                                        <th>Tgl Registrasi</th>
+                                        <th>Aksi</th>
                                     </tr>
                                 </thead>
-                                <tbody id="workers-tbody">
-                                </tbody>
+                                <tbody id="workers-tbody"></tbody>
                             </table>
                         </div>
+                    </div>
 
-                        <!-- Registration Form Section -->
-                        <div id="worker-register-section" class="sub-section">
-                            <div class="stats-section" style="background:#111; padding:30px; border:1px solid #333;">
-                                <h3 style="margin-bottom:25px; font-size:16px; color:#fff; text-transform:uppercase; letter-spacing:1px;">Form Pendaftaran Wajah</h3>
-                                <form id="worker-form" onsubmit="registerWorker(event)">
-                                    <div style="display:flex; flex-direction:column; gap:20px;">
-                                        <div style="display:flex; gap:20px; flex-wrap:wrap">
-                                            <div class="form-group" style="flex:1; min-width:150px">
-                                                <label>Worker ID</label>
-                                                <input type="text" id="worker-id" required placeholder="e.g. W001">
-                                            </div>
-                                            <div class="form-group" style="flex:1; min-width:150px">
-                                                <label>Full Name</label>
-                                                <input type="text" id="worker-name" required placeholder="e.g. Budi Santoso">
-                                            </div>
-                                        </div>
-                                        <div class="form-group">
-                                            <label>Upload Face Images (Min 3-5 images for better accuracy)</label>
-                                            <div style="background:#000; padding:20px; border:2px dashed #333; text-align:center;">
-                                                <input type="file" id="worker-images" multiple accept="image/jpeg, image/png" required style="width:auto; cursor:pointer;">
-                                                <p style="color:#555; font-size:11px; margin-top:10px;">Select multiple JPG/PNG files from your device</p>
-                                            </div>
-                                        </div>
-                                        <div style="display:flex; justify-content:flex-end; margin-top:10px;">
-                                            <button type="submit" class="btn btn-primary" id="worker-submit-btn" style="padding: 15px 40px;">Mulai Registrasi</button>
-                                        </div>
+                    <div id="worker-register-section" class="sub-section">
+                        <div class="card" style="max-width: 600px; margin: 0 auto;">
+                            <h4 style="margin-bottom: 24px;">Registrasi Wajah Baru</h4>
+                            <form id="worker-form" onsubmit="registerWorker(event)">
+                                <div class="form-group">
+                                    <label>Worker ID</label>
+                                    <input type="text" id="worker-id" required placeholder="W-001">
+                                </div>
+                                <div class="form-group">
+                                    <label>Nama Lengkap</label>
+                                    <input type="text" id="worker-name" required placeholder="Nama Lengkap">
+                                </div>
+                                <div class="form-group">
+                                    <label>Upload Sampel Wajah (Wajib 10 Foto)</label>
+                                    <div style="border: 2px dashed var(--border-slate-700); border-radius: 12px; padding: 32px; text-align: center;">
+                                        <input type="file" id="worker-images" multiple accept="image/*" required>
+                                        <p style="font-size: 12px; color: var(--text-slate-400); margin-top: 12px;">Klik untuk memilih atau seret file ke sini</p>
                                     </div>
-                                </form>
-                            </div>
+                                </div>
+                                <div style="display: flex; gap: 12px; margin-top: 12px;">
+                                    <button type="button" class="btn-action" onclick="openCameraRegistration()" style="flex: 1; justify-content: center; padding: 12px; background: var(--bg-slate-800); border: 1px solid var(--primary);">
+                                        📸 Daftar via Kamera
+                                    </button>
+                                    <button type="submit" class="btn-action btn-primary" id="worker-submit-btn" style="flex: 1; justify-content: center; padding: 12px;">
+                                        📁 Daftar via Upload
+                                    </button>
+                                </div>
+                            </form>
+                        </div>
+                    </div>
+
+                    <div id="worker-captures-section" class="sub-section">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;">
+                            <p style="color: var(--text-slate-400); font-size: 14px;">Capture wajah pelanggar yang tidak terdaftar. Pilih folder untuk didaftarkan sebagai pekerja.</p>
+                            <button class="btn-action" onclick="loadCaptures()">🔄 Refresh</button>
+                        </div>
+                        <div id="captures-grid" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 20px;">
+                            <!-- Captures loaded via JS -->
                         </div>
                     </div>
                 </div>
-                
-                <!-- Statistics Tab -->
-                <div id="statistics" class="tab-content">
-                    <!-- Daily Stats Chart -->
-                    <div class="stats-section">
-                        <div class="table-title">📊 Daily Statistics</div>
-                        <div class="date-filter">
-                            <label>Date Range:</label>
-                            <input type="date" id="start-date" onchange="updateDailyStats()">
-                            <span>to</span>
-                            <input type="date" id="end-date" onchange="updateDailyStats()">
-                            <button class="btn-secondary" onclick="updateDailyStats()">Update</button>
-                        </div>
-                        <div class="chart-container">
-                            <canvas id="daily-chart" width="800" height="400"></canvas>
-                        </div>
-                    </div>
-                    
-                    <!-- Summary Stats -->
-                    <div class="stats-grid">
-                        <div class="stat-card">
-                            <div class="stat-value" id="total-violations">0</div>
-                            <div class="stat-label">Total Violations</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-value" id="no-helmet-count">0</div>
-                            <div class="stat-label">No Helmets</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-value" id="no-vest-count">0</div>
-                            <div class="stat-label">No Vests</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-value" id="active-cameras">0</div>
-                            <div class="stat-label">Active Cameras</div>
-                        </div>
-                    </div>
-                </div>
-                
-                <!-- Violations Tab -->
-                <div id="violations" class="tab-content">
-                    <div class="violations-table">
-                        <div class="table-header">
-                            <div class="table-title">📋 Violation Log</div>
-                            <div class="export-options">
-                                <button class="export-btn" onclick="exportData('pdf')">📄 PDF</button>
-                                <button class="export-btn" onclick="exportData('excel')">📊 Excel</button>
-                                <button class="export-btn" onclick="exportData('csv')">📄 CSV</button>
-                            </div>
-                        </div>
-                        <div class="date-filter">
-                            <label>Date Range:</label>
-                            <input type="date" id="violation-start-date" onchange="loadViolations()">
-                            <span>to</span>
-                            <input type="date" id="violation-end-date" onchange="loadViolations()">
-                            <button class="btn-secondary" onclick="loadViolations()">Filter</button>
-                        </div>
-                        <table>
-                            <thead>
-                                <tr>
-                                    <th>Time</th>
-                                    <th>Date</th>
-                                    <th>Camera</th>
-                                    <th>Violation Type</th>
-                                    <th>Person ID</th>
-                                    <th>Confidence</th>
-                                </tr>
-                            </thead>
-                            <tbody id="violations-tbody">
-                                <!-- Violations will be loaded here -->
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
-                
+
                 <!-- Settings Tab -->
                 <div id="settings" class="tab-content">
-                    <div class="violations-table">
-                        <div class="table-title">⚙️ System Settings</div>
+                    <h3 style="font-size: 20px; font-family: 'Outfit'; font-weight: 800; margin-bottom: 24px;">Pengaturan Sistem</h3>
+                    <div class="card" style="max-width: 500px;">
                         <div class="form-group">
-                            <label>Detection Cooldown (seconds)</label>
-                            <input type="number" id="cooldown-setting" value="5" min="1" max="60">
+                            <label>Cooldown Deteksi (Detik)</label>
+                            <input type="number" id="cooldown-setting" value="5">
+                            <p style="font-size: 11px; color: var(--text-slate-400); margin-top: 4px;">Waktu jeda antar deteksi pelanggaran serupa.</p>
                         </div>
                         <div class="form-group">
-                            <label>Confidence Threshold</label>
-                            <input type="number" id="confidence-setting" value="0.3" min="0.1" max="1.0" step="0.1">
+                            <label>Treshold (Confidence)</label>
+                            <input type="range" id="confidence-setting" min="0.1" max="1.0" step="0.05" value="0.3" style="accent-color: var(--primary);">
+                            <div style="display: flex; justify-content: space-between; font-size: 11px; color: var(--text-slate-400);">
+                                <span>0.1 (Sensitif)</span>
+                                <span>1.0 (Ketat)</span>
+                            </div>
                         </div>
-                        <button class="control-btn start" onclick="saveSettings()">Save Settings</button>
+                        <button class="btn-action btn-primary" onclick="saveSettings()" style="width: 100%; justify-content: center; padding: 12px;">Simpan Perubahan</button>
                     </div>
                 </div>
             </div>
+        </main>
+    </div>
+
+    <!-- Modals -->
+    <div id="camera-modal" class="modal">
+        <div class="modal-content">
+            <h3 id="modal-title" style="margin-bottom: 24px; font-family: 'Outfit'; font-weight: 800;">Konfigurasi Kamera</h3>
+            <div class="form-group">
+                <label>Nama Kamera</label>
+                <input type="text" id="camera-name" placeholder="Pintu Utama">
+            </div>
+            <div class="form-group">
+                <label>Sumber Video</label>
+                <select id="camera-source" onchange="handleSourceChange()">
+                    <option value="">-- Pilih Sumber --</option>
+                    <option value="0">Webcam Internal</option>
+                    <option value="1">Webcam Eksternal</option>
+                    <option value="rtsp">CCTV (RTSP Stream)</option>
+                    <option value="file">File Video (MP4)</option>
+                </select>
+            </div>
+            <div id="rtsp-group" style="display:none;" class="form-group">
+                <label>RTSP URL</label>
+                <input type="text" id="rtsp-url" placeholder="rtsp://admin:pass@ip:port/stream">
+            </div>
+            <div id="file-group" style="display:none;" class="form-group">
+                <label>Path Video</label>
+                <input type="text" id="file-path" placeholder="C:/videos/footage.mp4">
+            </div>
+            <div style="display: flex; gap: 12px; margin-top: 32px;">
+                <button class="btn-action" style="flex: 1; justify-content: center;" onclick="closeCameraModal()">Batal</button>
+                <button class="btn-action btn-primary" style="flex: 1; justify-content: center;" onclick="addCamera()">Simpan</button>
+            </div>
         </div>
     </div>
-    
+
+    </div>
+
+    <!-- Registration Camera Modal -->
+    <div id="registration-camera-modal" class="modal">
+        <div class="modal-content" style="max-width: 700px; padding: 20px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                <h3 style="font-family: 'Outfit'; font-weight: 800;">Pengambilan Sampel Wajah Otomatis</h3>
+                <span id="capture-count" class="badge badge-primary">0 / 10 Foto</span>
+            </div>
+            
+            <div style="position: relative; border-radius: 12px; overflow: hidden; background: #000; aspect-ratio: 16/9; margin-bottom: 20px;">
+                <video id="registration-video" autoplay playsinline style="width: 100%; height: 100%; object-fit: cover;"></video>
+                <canvas id="registration-canvas" style="display: none;"></canvas>
+                
+                <!-- Overlay Panduan -->
+                <div id="capture-overlay" style="position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; background: rgba(0,0,0,0.4); pointer-events: none;">
+                    <div id="face-guide-box" style="width: 250px; height: 300px; border: 2px dashed #fff; border-radius: 100px; transition: all 0.3s;"></div>
+                    <p id="capture-instruction" style="margin-top: 20px; color: #fff; font-weight: 700; text-shadow: 0 2px 4px rgba(0,0,0,0.8); background: var(--primary); padding: 8px 20px; border-radius: 20px;">Mempersiapkan Kamera...</p>
+                </div>
+            </div>
+
+            <!-- Progress Bar -->
+            <div style="height: 6px; width: 100%; background: var(--bg-slate-800); border-radius: 3px; margin-bottom: 24px; overflow: hidden;">
+                <div id="capture-progress" style="height: 100%; width: 0%; background: var(--primary); transition: width 0.3s;"></div>
+            </div>
+
+            <div style="display: flex; gap: 12px;">
+                <button id="stop-capture-btn" class="btn-action" style="flex: 1; justify-content: center;" onclick="closeCameraRegistration()">Batal</button>
+                <button id="start-capture-btn" class="btn-action btn-primary" style="flex: 2; justify-content: center;" onclick="startGuidedCapture()">Mulai Pengambilan Foto</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Export Filter Modal -->
+    <div id="export-modal" class="modal-overlay">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h4 class="modal-title">Filter Laporan</h4>
+                <p style="font-size: 13px; color: var(--text-slate-400); margin-top: 8px;">Pilih rentang tanggal untuk data yang ingin di-export.</p>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label>Dari Tanggal</label>
+                    <input type="date" id="export-start-date" class="btn-action" style="width: 100%; padding: 12px; margin-top: 8px;">
+                </div>
+                <div class="form-group" style="margin-top: 20px;">
+                    <label>Sampai Tanggal</label>
+                    <input type="date" id="export-end-date" class="btn-action" style="width: 100%; padding: 12px; margin-top: 8px;">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-action" style="flex: 1; justify-content: center;" onclick="closeExportModal()">Batal</button>
+                <button class="btn-action btn-primary" style="flex: 1; justify-content: center;" onclick="confirmExport()">Download Laporan</button>
+            </div>
+        </div>
+    </div>
+
     <script>
+        // Set tema awal sebelum halaman loading selesai agar tidak berkedip
+        if(localStorage.getItem('theme') === 'light') {
+            document.body.classList.add('light-mode');
+        }
+
+        function toggleLightMode() {
+            document.body.classList.toggle('light-mode');
+            const btn = document.getElementById('theme-btn');
+            if(document.body.classList.contains('light-mode')) {
+                btn.innerHTML = '<span>🌙</span> Mode Gelap';
+                localStorage.setItem('theme', 'light');
+            } else {
+                btn.innerHTML = '<span>💡</span> Mode Terang';
+                localStorage.setItem('theme', 'dark');
+            }
+        }
+        
+        // Sesuaikan tulisan tombol saat pertama dimuat
+        document.addEventListener('DOMContentLoaded', () => {
+            const btn = document.getElementById('theme-btn');
+            if(document.body.classList.contains('light-mode') && btn) {
+                btn.innerText = '🌙 Gelap';
+            }
+        });
         let currentTab = 'cameras';
         let editingCameraId = null;
         let currentViewMode = 4;  // 1,2,4,8,16 cams
         
+        function changeViewMode() {
+            const val = document.getElementById('view-mode').value;
+            currentViewMode = (val === 'all') ? 'all' : parseInt(val, 10);
+            loadCameras();
+        }
+
         function showTab(tabName) {
-            // Hide all tabs
-            document.querySelectorAll('.tab-content').forEach(tab => {
-                tab.classList.remove('active');
-            });
-            document.querySelectorAll('.nav-tab').forEach(tab => {
-                tab.classList.remove('active');
-            });
+            // Updated for new .nav-item structure
+            document.querySelectorAll('.tab-content').forEach(tab => tab.classList.remove('active'));
+            document.querySelectorAll('.nav-item').forEach(item => item.classList.remove('active'));
             
-            // Show selected tab
             document.getElementById(tabName).classList.add('active');
-            event.target.classList.add('active');
+            document.getElementById('nav-' + tabName).classList.add('active');
+            
+            const titles = {
+                'cameras': 'Monitoring Kamera',
+                'statistics': 'Analisis Statistik',
+                'violations': 'Log Pelanggaran',
+                'workers': 'Manajemen Pekerja',
+                'settings': 'Pengaturan Sistem'
+            };
+            document.getElementById('current-tab-title').textContent = titles[tabName] || 'Dashboard';
+            
             currentTab = tabName;
             
-            // Load tab-specific data
-            if (tabName === 'cameras') {
-                loadCameras();
-            } else if (tabName === 'statistics') {
-                loadStatistics();
-            } else if (tabName === 'violations') {
-                loadViolations();
-            } else if (tabName === 'workers') {
-                showWorkerSection('list');
+            if (tabName === 'cameras') loadCameras();
+            else if (tabName === 'statistics') loadStatistics();
+            else if (tabName === 'violations') loadViolations();
+            else if (tabName === 'workers') showWorkerSection('list');
+        }
+        
+        function toggleSubmenu(id) {
+            const submenu = document.getElementById('submenu-' + id);
+            const navItem = document.getElementById('nav-' + id);
+            const isExpanding = !submenu.classList.contains('active');
+            
+            // Close other submenus first (optional, but cleaner)
+            document.querySelectorAll('.submenu').forEach(s => s.classList.remove('active'));
+            document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('expanded'));
+            
+            if (isExpanding) {
+                submenu.classList.add('active');
+                navItem.classList.add('expanded');
+                showTab(id); // Switch to the main tab when expanding
             }
+        }
+
+        function switchToWorkerSection(section) {
+            showTab('workers');
+            showWorkerSection(section);
+            // Ensure submenu is expanded
+            document.getElementById('submenu-workers').classList.add('active');
+            document.getElementById('nav-workers').classList.add('expanded');
         }
         
         function showWorkerSection(section) {
-            // Hide all sub-sections
+            // Hide all sub-sections and clear submenu items
             document.querySelectorAll('.sub-section').forEach(s => s.classList.remove('active'));
-            document.querySelectorAll('.sub-nav-item').forEach(s => s.classList.remove('active'));
+            document.querySelectorAll('.submenu-item').forEach(s => s.classList.remove('active'));
             
             if (section === 'list') {
                 document.getElementById('worker-list-section').classList.add('active');
-                document.getElementById('btn-list-worker').classList.add('active');
+                document.getElementById('sub-list').classList.add('active');
                 loadWorkers();
             } else if (section === 'register') {
                 document.getElementById('worker-register-section').classList.add('active');
-                document.getElementById('btn-register-worker').classList.add('active');
+                document.getElementById('sub-register').classList.add('active');
+            } else if (section === 'captures') {
+                document.getElementById('worker-captures-section').classList.add('active');
+                document.getElementById('sub-captures').classList.add('active');
+                loadCaptures();
             }
         }
         
@@ -2104,7 +2277,7 @@ DASHBOARD_TEMPLATE = """
                         grid.innerHTML = `
                             <div style="grid-column: 1/-1; text-align: center; padding: 60px; color: #888; background: #111; border: 2px solid #333; border-radius: 8px;">
                                 <div style="font-size: 24px; margin-bottom: 20px;">📹</div>
-                                <div style="font-size: 18px; margin-bottom: 10px; color: #fff;">No Cameras Added Yet</div>
+                                <div style="font-size: 18px; margin-bottom: 10px; color: var(--text-slate-50);">No Cameras Added Yet</div>
                                 <div style="font-size: 14px; color: #666;">Add a camera using the form above</div>
                             </div>
                         `;
@@ -2118,20 +2291,28 @@ DASHBOARD_TEMPLATE = """
                     else if (currentViewMode === 4) cols = 2;  // 2x2 layout
                     else if (currentViewMode === 8) cols = 4;  // 4x2 layout (2 rows x 4 cols)
                     else if (currentViewMode === 16) cols = 4; // 4x4 layout
+                    else if (currentViewMode === 'all') {
+                        // Adaptive grid: 2 cols for up to 4, 3 cols for up to 9, 4 cols for more
+                        const count = data.cameras.length;
+                        if (count <= 1) cols = 1;
+                        else if (count <= 4) cols = 2;
+                        else if (count <= 9) cols = 3;
+                        else cols = 4;
+                    }
                     grid.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
 
                     // Add body class for CSS per-mode styling
-                    document.body.classList.remove('view-mode-1','view-mode-2','view-mode-4','view-mode-8','view-mode-16');
+                    document.body.classList.remove('view-mode-1','view-mode-2','view-mode-4','view-mode-8','view-mode-16','view-mode-all');
                     document.body.classList.add(`view-mode-${currentViewMode}`);
 
                     // Select cameras to display based on view mode
-                    const camerasToShow = data.cameras.slice(0, currentViewMode);
+                    const camerasToShow = (currentViewMode === 'all') ? data.cameras : data.cameras.slice(0, currentViewMode);
                     
                     if (camerasToShow.length === 0) {
                         grid.innerHTML = `
                             <div style="grid-column: 1/-1; text-align: center; padding: 60px; color: #888; background: #111; border: 2px solid #333; border-radius: 8px;">
                                 <div style="font-size: 24px; margin-bottom: 20px;">📹</div>
-                                <div style="font-size: 18px; margin-bottom: 10px; color: #fff;">No Cameras to Display</div>
+                                <div style="font-size: 18px; margin-bottom: 10px; color: var(--text-slate-50);">No Cameras to Display</div>
                                 <div style="font-size: 14px; color: #666;">Add cameras or adjust view mode</div>
                             </div>
                         `;
@@ -2148,7 +2329,7 @@ DASHBOARD_TEMPLATE = """
                     grid.innerHTML = `
                         <div style="grid-column: 1/-1; text-align: center; padding: 60px; color: #ff0000; background: #111; border: 2px solid #ff0000; border-radius: 8px;">
                             <div style="font-size: 24px; margin-bottom: 20px;">❌</div>
-                            <div style="font-size: 18px; margin-bottom: 10px; color: #fff;">Error Loading Cameras</div>
+                            <div style="font-size: 18px; margin-bottom: 10px; color: var(--text-slate-50);">Error Loading Cameras</div>
                             <div style="font-size: 14px; color: #666;">${error.message || 'Unknown error'}</div>
                             <button onclick="loadCameras()" style="margin-top: 20px; padding: 10px 20px; background: #000; color: #fff; border: 2px solid #fff; cursor: pointer;">Retry</button>
                         </div>
@@ -2157,27 +2338,39 @@ DASHBOARD_TEMPLATE = """
         }
         
         function createCameraCard(camera) {
+            const statusClass = camera.status === 'active' ? '' : 'offline';
+            const statusLabel = camera.status === 'active' ? 'ONLINE' : 'OFFLINE';
+            
             return `
-                <div class="camera-card">
-                    <div class="camera-header">
-                        <div class="camera-title">${camera.name.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>
-                        <div class="camera-status">
-                            <div class="status-dot ${camera.status === 'active' ? 'active' : ''}"></div>
-                            <div class="status-text">${camera.status.toUpperCase()}</div>
-                        </div>
+                <div class="card" style="padding: 16px;">
+                    <div class="card-header" style="margin-bottom: 12px;">
+                        <h4 class="card-title" style="font-size: 14px;">
+                            ${camera.name.replace(/</g, '&lt;').replace(/>/g, '&gt;')}
+                        </h4>
+                        <span class="status-badge ${statusClass}">${statusLabel}</span>
                     </div>
                     <div class="video-container">
-                        <img class="video-feed" src="/camera_feed/${camera.id}" alt="${camera.name.replace(/</g, '&lt;').replace(/>/g, '&gt;')}">
+                        <img class="video-feed" src="/camera_feed/${camera.id}?t=${new Date().getTime()}" alt="${camera.name}">
                     </div>
-                    <div class="camera-info">
-                        <div class="info-text">Source: ${camera.source.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>
-                        <div class="info-text">ID: CAM-${camera.id}</div>
-                    </div>
-                    <div class="camera-controls">
-                        <button class="control-btn start" data-action="start" data-camera-id="${camera.id}">Start</button>
-                        <button class="control-btn stop" data-action="stop" data-camera-id="${camera.id}">Stop</button>
-                        <button class="control-btn" data-action="edit" data-camera-id="${camera.id}" data-camera-name="${camera.name.replace(/"/g, '&quot;')}" data-camera-source="${camera.source.replace(/"/g, '&quot;')}">Edit</button>
-                        <button class="control-btn stop" data-action="delete" data-camera-id="${camera.id}">Delete</button>
+                    <div style="margin-top:12px; display:flex; flex-direction:column; gap:8px;">
+                        <div style="display:flex; justify-content:space-between; font-size:11px; color:var(--text-slate-400);">
+                            <span>ID: CAM-${camera.id}</span>
+                            <span style="max-width:150px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">Source: ${camera.source}</span>
+                        </div>
+                        <div style="display:flex; gap:8px; margin-top:4px;">
+                            <button class="btn-action ${camera.status === 'active' ? '' : 'btn-primary'}" style="flex:1; justify-content:center; padding:6px;" data-action="start" data-camera-id="${camera.id}">
+                                Start
+                            </button>
+                            <button class="btn-action" style="flex:1; justify-content:center; padding:6px;" data-action="stop" data-camera-id="${camera.id}">
+                                Stop
+                            </button>
+                            <button class="btn-action" style="padding:6px;" data-action="edit" data-camera-id="${camera.id}" data-camera-name="${camera.name.replace(/"/g, '&quot;')}" data-camera-source="${camera.source.replace(/"/g, '&quot;')}">
+                                ⚙️
+                            </button>
+                            <button class="btn-action" style="padding:6px; color:#f87171; border-color:rgba(239,68,68,0.1);" data-action="delete" data-camera-id="${camera.id}">
+                                🗑️
+                            </button>
+                        </div>
                     </div>
                 </div>
             `;
@@ -2202,6 +2395,34 @@ DASHBOARD_TEMPLATE = """
             }
         });
         
+        // Auto-refresh timer (10 seconds)
+        let refreshInterval = setInterval(() => {
+            if (currentTab === 'statistics') {
+                loadStatistics();
+            } else if (currentTab === 'violations') {
+                loadViolations();
+            } else if (currentTab === 'cameras') {
+                 // Check if camera feeds need any periodic updates (but they are MJPEG, so no)
+            }
+        }, 10000);
+
+        function resetData() {
+            if (!confirm('AWAS! Apakah Anda yakin ingin menghapus semua data statistik dan log pelanggaran? Tindakan ini tidak dapat dibatalkan.')) return;
+            
+            fetch('/api/violations/reset', { method: 'POST' })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.success) {
+                        alert('Data berhasil direset.');
+                        loadStatistics();
+                        if (currentTab === 'violations') loadViolations();
+                    } else {
+                        alert('Gagal mereset data: ' + data.message);
+                    }
+                })
+                .catch(err => alert('Error mereset data.'));
+        }
+        
         function loadStatistics() {
             fetch('/api/statistics')
                 .then(r => r.json())
@@ -2211,10 +2432,28 @@ DASHBOARD_TEMPLATE = """
                     document.getElementById('no-vest-count').textContent = data.no_vest_count;
                     document.getElementById('active-cameras').textContent = data.active_cameras;
                     
-                    // Load daily stats
+                    const apdVal  = typeof data.avg_apd_accuracy  === 'number' ? data.avg_apd_accuracy  : 0;
+                    const faceVal = typeof data.avg_face_accuracy  === 'number' ? data.avg_face_accuracy : 0;
+                    
+                    document.getElementById('avg-apd-accuracy').textContent  = apdVal.toFixed(1)  + '%';
+                    document.getElementById('avg-face-accuracy').textContent = faceVal.toFixed(1) + '%';
+                    
+                    // Update Circular Progress (Circumference is exactly 100)
+                    const apdOffset = 100 - Math.min(apdVal, 100);
+                    const faceOffset = 100 - Math.min(faceVal, 100);
+                    
+                    document.getElementById('apd-circle').style.strokeDashoffset = apdOffset;
+                    document.getElementById('face-circle').style.strokeDashoffset = faceOffset;
+                    
+                    // Update trend
+                    const now = new Date();
+                    document.getElementById('last-update').textContent = 'Terakhir Diupdate: ' + now.toLocaleTimeString();
+                    
                     updateDailyStats();
                 });
         }
+        
+        
         
         function updateDailyStats() {
             const startDate = document.getElementById('start-date').value;
@@ -2227,62 +2466,128 @@ DASHBOARD_TEMPLATE = """
                 });
         }
         
+        let dailyChartInstance = null;
+
         function drawChart(data) {
-            const canvas = document.getElementById('daily-chart');
-            const ctx = canvas.getContext('2d');
-            
-            // Clear canvas
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-            
-            // Simple bar chart
+            const ctx = document.getElementById('daily-chart').getContext('2d');
             const dates = Object.keys(data);
             const helmetCounts = dates.map(date => data[date].no_helmet || 0);
             const vestCounts = dates.map(date => data[date].no_vest || 0);
             
-            const maxValue = Math.max(...helmetCounts, ...vestCounts, 1);
-            const barWidth = 60;
-            const barSpacing = 20;
-            const chartHeight = 300;
-            const chartStartY = 50;
+            // Re-use instance for smooth animations if possible
+            if (dailyChartInstance && JSON.stringify(dailyChartInstance.data.labels) === JSON.stringify(dates)) {
+                dailyChartInstance.data.datasets[0].data = helmetCounts;
+                dailyChartInstance.data.datasets[1].data = vestCounts;
+                dailyChartInstance.update('none'); // Update without full re-animation to be subtle
+                return;
+            }
+
+            if (dailyChartInstance) dailyChartInstance.destroy();
             
-            // Draw axes
-            ctx.strokeStyle = '#fff';
-            ctx.lineWidth = 2;
-            ctx.beginPath();
-            ctx.moveTo(50, chartStartY);
-            ctx.lineTo(50, chartStartY + chartHeight);
-            ctx.lineTo(750, chartStartY + chartHeight);
-            ctx.stroke();
+            // Create nice gradients for the area fill
+            const cyanGradient = ctx.createLinearGradient(0, 0, 0, 200);
+            cyanGradient.addColorStop(0, 'rgba(0, 229, 255, 0.15)');
+            cyanGradient.addColorStop(1, 'rgba(0, 229, 255, 0)');
             
-            // Draw bars
-            dates.forEach((date, index) => {
-                const x = 80 + index * (barWidth * 2 + barSpacing);
-                const helmetHeight = (helmetCounts[index] / maxValue) * chartHeight;
-                const vestHeight = (vestCounts[index] / maxValue) * chartHeight;
-                
-                // No Helmet bar
-                ctx.fillStyle = '#ff0000';
-                ctx.fillRect(x, chartStartY + chartHeight - helmetHeight, barWidth, helmetHeight);
-                
-                // No Vest bar
-                ctx.fillStyle = '#ffaa00';
-                ctx.fillRect(x + barWidth, chartStartY + chartHeight - vestHeight, barWidth, vestHeight);
-                
-                // Date label
-                ctx.fillStyle = '#fff';
-                ctx.font = '10px Courier New';
-                ctx.fillText(date, x, chartStartY + chartHeight + 20);
+            const greyGradient = ctx.createLinearGradient(0, 0, 0, 200);
+            greyGradient.addColorStop(0, 'rgba(136, 136, 136, 0.1)');
+            greyGradient.addColorStop(1, 'rgba(136, 136, 136, 0)');
+
+            dailyChartInstance = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: dates.map(d => {
+                        const date = new Date(d);
+                        return date.toLocaleDateString('id-ID', { day: 'numeric', month: 'short' });
+                    }),
+                    datasets: [
+                        {
+                            label: 'Tanpa Helm',
+                            data: helmetCounts,
+                            borderColor: '#00e5ff',
+                            backgroundColor: cyanGradient,
+                            borderWidth: 3,
+                            fill: true,
+                            tension: 0.4, // Smooth Bezier curves
+                            pointRadius: 4,
+                            pointBackgroundColor: '#00e5ff',
+                            pointBorderColor: '#000',
+                            pointBorderWidth: 2,
+                            pointHoverRadius: 6
+                        },
+                        {
+                            label: 'Tanpa Rompi',
+                            data: vestCounts,
+                            borderColor: '#888',
+                            backgroundColor: greyGradient,
+                            borderWidth: 3,
+                            fill: true,
+                            tension: 0.4,
+                            pointRadius: 4,
+                            pointBackgroundColor: '#888',
+                            pointBorderColor: '#000',
+                            pointBorderWidth: 2,
+                            pointHoverRadius: 6
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: { 
+                        legend: { 
+                            position: 'top',
+                            align: 'end',
+                            labels: { color: '#666', boxWidth: 12, font: { size: 10, weight: 'bold' }, padding: 20 } 
+                        },
+                        tooltip: {
+                            backgroundColor: 'rgba(0,0,0,0.85)',
+                            titleColor: '#fff',
+                            bodyColor: '#aaa',
+                            borderColor: '#333',
+                            borderWidth: 1,
+                            padding: 12,
+                            displayColors: true,
+                            cornerRadius: 4,
+                            callbacks: {
+                                title: (tooltipItems) => {
+                                    const d = dates[tooltipItems[0].dataIndex];
+                                    return new Date(d).toLocaleDateString('id-ID', { 
+                                        weekday: 'long', 
+                                        day: 'numeric', 
+                                        month: 'long', 
+                                        year: 'numeric' 
+                                    });
+                                }
+                            }
+                        }
+                    },
+                    scales: {
+                        x: { 
+                            grid: { display: false }, 
+                            ticks: { 
+                                color: '#94a3b8', 
+                                font: { size: 10, weight: 'bold' },
+                                maxRotation: 0,
+                                autoSkip: true
+                            } 
+                        },
+                        y: { 
+                            beginAtZero: true, 
+                            grid: { color: 'rgba(255, 255, 255, 0.05)', drawBorder: false }, 
+                            ticks: { 
+                                color: 'var(--text-slate-400)', 
+                                font: { size: 10, family: 'Inter' },
+                                precision: 0 // Keep integers for counts
+                            } 
+                        }
+                    },
+                    interaction: {
+                        mode: 'index',
+                        intersect: false
+                    }
+                }
             });
-            
-            // Legend
-            ctx.fillStyle = '#ff0000';
-            ctx.fillRect(600, 20, 15, 15);
-            ctx.fillStyle = '#fff';
-            ctx.fillText('No Helmet', 620, 32);
-            
-            ctx.fillStyle = '#ffaa00';
-            ctx.fillRect(600, 40, 15, 15);
-            ctx.fillText('No Vest', 620, 52);
         }
         
         function loadViolations() {
@@ -2303,31 +2608,57 @@ DASHBOARD_TEMPLATE = """
                     data.violations.forEach(violation => {
                         const row = document.createElement('tr');
                         const date = new Date(violation.timestamp);
-                        const personId = `PERSON-${Math.floor(Math.random() * 10000)}`;
+                        const workerId = violation.worker_id && violation.worker_id !== 'Unknown' 
+                            ? violation.worker_id 
+                            : 'Unknown ID';
                         
                         row.innerHTML = `
-                            <td>${date.toLocaleTimeString()}</td>
-                            <td>${date.toLocaleDateString()}</td>
+                            <td style="font-weight:600;">${date.toLocaleTimeString()}</td>
+                            <td style="color:var(--text-slate-400);">${date.toLocaleDateString()}</td>
                             <td>${violation.camera_name || 'Camera ' + violation.camera_id}</td>
                             <td><span class="violation-badge ${violation.violation_type}">${violation.violation_type.replace('no', 'No ').toUpperCase()}</span></td>
-                            <td>${personId}</td>
-                            <td>${(violation.confidence * 100).toFixed(1)}%</td>
+                            <td><span style="font-weight:700; color:${workerId === 'Unknown ID' ? '#ff6d00' : '#00e5ff'};">${workerId}</span></td>
+                            <td style="font-family:monospace; font-weight:600;">${(violation.confidence * 100).toFixed(1)}%</td>
                         `;
                         tbody.appendChild(row);
                     });
-                });
+                })
+                .catch(err => console.error('Error loading violations:', err));
         }
         
+        let pendingExportFormat = null;
+
         function exportData(format) {
-            const startDate = document.getElementById('violation-start-date').value;
-            const endDate = document.getElementById('violation-end-date').value;
+            pendingExportFormat = format;
+            document.getElementById('export-modal').classList.add('active');
             
-            let url = `/api/export?format=${format}`;
-            if (startDate && endDate) {
-                url += `&start=${startDate}&end=${endDate}`;
+            // Set default dates to today if empty
+            const today = new Date().toISOString().split('T')[0];
+            if (!document.getElementById('export-start-date').value) {
+                document.getElementById('export-start-date').value = today;
+            }
+            if (!document.getElementById('export-end-date').value) {
+                document.getElementById('export-end-date').value = today;
+            }
+        }
+
+        function closeExportModal() {
+            document.getElementById('export-modal').classList.remove('active');
+            pendingExportFormat = null;
+        }
+
+        function confirmExport() {
+            const start = document.getElementById('export-start-date').value;
+            const end = document.getElementById('export-end-date').value;
+            
+            if (!start || !end) {
+                alert('Pilih rentang tanggal terlebih dahulu!');
+                return;
             }
             
+            let url = `/api/export?format=${pendingExportFormat}&start=${start}&end=${end}`;
             window.open(url);
+            closeExportModal();
         }
         
         function loadWorkers() {
@@ -2342,11 +2673,16 @@ DASHBOARD_TEMPLATE = """
                         const row = document.createElement('tr');
                         const date = new Date(w.registration_date);
                         row.innerHTML = `
-                            <td>${w.worker_id}</td>
+                            <td style="font-weight:700;">${w.worker_id}</td>
                             <td>${w.name}</td>
-                            <td>${w.num_images}</td>
-                            <td>${date.toLocaleString()}</td>
-                            <td><button class="btn btn-secondary" onclick="deleteWorker('${w.worker_id}')" style="padding:4px 8px; font-size:11px; background:#f00; color:#fff; border:none; cursor:pointer;">Delete</button></td>
+                            <td><span class="status-badge" style="background:rgba(99,102,241,0.1); color:var(--primary); border:none;">${w.num_images} Foto</span></td>
+                            <td style="color:var(--text-slate-400); font-size:12px;">${date.toLocaleString()}</td>
+                            <td>
+                                <div style="display:flex; gap:8px;">
+                                    <button class="btn-action" onclick="openEditWorkerModal('${w.worker_id}', '${w.name}')" style="padding:4px 10px; font-size:11px;">Edit</button>
+                                    <button class="btn-action" onclick="deleteWorker('${w.worker_id}')" style="padding:4px 10px; font-size:11px; color:#f87171;">Hapus</button>
+                                </div>
+                            </td>
                         `;
                         tbody.appendChild(row);
                     });
@@ -2364,6 +2700,13 @@ DASHBOARD_TEMPLATE = """
             formData.append('name', document.getElementById('worker-name').value);
             
             const files = document.getElementById('worker-images').files;
+            if (files.length !== 10) {
+                alert('Harus pas 10 foto ya Pak, tidak boleh kurang atau lebih. Saat ini Bapak memilih ' + files.length + ' foto.');
+                btn.disabled = false;
+                btn.textContent = 'Daftarkan Pekerja';
+                return;
+            }
+            
             for(let i=0; i<files.length; i++){
                 formData.append('images', files[i]);
             }
@@ -2401,15 +2744,201 @@ DASHBOARD_TEMPLATE = """
                 }
             });
         }
-        
-        function changeViewMode() {
-            const select = document.getElementById('view-mode');
-            currentViewMode = parseInt(select.value, 10) || 1;
-            if (currentTab === 'cameras') {
-                loadCameras();
+
+        function openEditWorkerModal(id, name) {
+            document.getElementById('edit-worker-id').value = id;
+            document.getElementById('edit-worker-name').value = name;
+            document.getElementById('worker-modal').classList.add('active');
+        }
+
+        function closeWorkerModal() {
+            document.getElementById('worker-modal').classList.remove('active');
+        }
+
+        function saveWorkerEdit() {
+            const id = document.getElementById('edit-worker-id').value;
+            const name = document.getElementById('edit-worker-name').value;
+            
+            if(!name) {
+                alert('Nama tidak boleh kosong');
+                return;
+            }
+            
+            const btn = document.getElementById('worker-edit-submit-btn');
+            btn.disabled = true;
+            btn.textContent = 'Menyimpan...';
+            
+            fetch('/api/workers/' + id, {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ name: name })
+            })
+            .then(r => r.json())
+            .then(data => {
+                if(data.success) {
+                    closeWorkerModal();
+                    loadWorkers();
+                } else {
+                    alert('Gagal menyimpan: ' + (data.error || 'Server error'));
+                }
+            })
+            .catch(err => alert('Error updating worker'))
+            .finally(() => {
+                btn.disabled = false;
+                btn.textContent = 'Simpan Perubahan';
+            });
+        }
+
+        // Guided Camera Registration Logic (RESTORED)
+        let registrationStream = null;
+        let captureActive = false;
+        let currentStep = 0;
+        const totalSteps = 10;
+        const instructions = [
+            "Hadap Depan (Tatap Kamera)",
+            "Sedikit ke Kiri",
+            "Sedikit ke Kanan",
+            "Mendongak Sedikit (Atas)",
+            "Menunduk Sedikit (Bawah)",
+            "Ekspresi Senyum",
+            "Hadap Depan (Normal)",
+            "Miring Kiri 45 Derajat",
+            "Miring Kanan 45 Derajat",
+            "Tatap Kamera (Terakhir!)"
+        ];
+
+        async function openCameraRegistration() {
+            const workerId = document.getElementById('worker-id').value;
+            const workerName = document.getElementById('worker-name').value;
+            
+            if(!workerId || !workerName) {
+                alert('Mohon isi Worker ID dan Nama Lengkap terlebih dahulu!');
+                return;
+            }
+
+            try {
+                registrationStream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { width: 1280, height: 720 } 
+                });
+                const video = document.getElementById('registration-video');
+                video.srcObject = registrationStream;
+                document.getElementById('registration-camera-modal').classList.add('active');
+                
+                // Reset UI
+                currentStep = 0;
+                updateCaptureUI();
+                document.getElementById('start-capture-btn').disabled = false;
+                document.getElementById('start-capture-btn').textContent = 'Mulai Pengambilan Foto';
+            } catch (err) {
+                alert('Gagal mengakses kamera: ' + err.message);
             }
         }
-        
+
+        function closeCameraRegistration() {
+            if(registrationStream) {
+                registrationStream.getTracks().forEach(track => track.stop());
+            }
+            document.getElementById('registration-camera-modal').classList.remove('active');
+            captureActive = false;
+        }
+
+        function updateCaptureUI() {
+            const progress = (currentStep / totalSteps) * 100;
+            document.getElementById('capture-progress').style.width = progress + '%';
+            document.getElementById('capture-count').textContent = `${currentStep} / ${totalSteps} Foto`;
+            document.getElementById('capture-instruction').textContent = instructions[currentStep] || 'Selesai!';
+            
+            // Visual feedback box
+            const guide = document.getElementById('face-guide-box');
+            guide.style.borderColor = captureActive ? 'var(--primary)' : '#fff';
+        }
+
+        async function startGuidedCapture() {
+            if(captureActive) return;
+            captureActive = true;
+            document.getElementById('start-capture-btn').disabled = true;
+            
+            const workerId = document.getElementById('worker-id').value;
+            const workerName = document.getElementById('worker-name').value;
+            const video = document.getElementById('registration-video');
+            const canvas = document.getElementById('registration-canvas');
+            const context = canvas.getContext('2d');
+            
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+
+            for(currentStep = 0; currentStep < totalSteps; currentStep++) {
+                updateCaptureUI();
+                
+                // Countdown/Delay sebelum tiap foto (2 detik agar user sempat ganti pose)
+                for(let i=3; i>0; i--) {
+                    if(!captureActive) return;
+                    document.getElementById('capture-instruction').textContent = `${instructions[currentStep]} (${i}...)`;
+                    await new Promise(r => setTimeout(r, 700));
+                }
+
+                if(!captureActive) return;
+                
+                // Flash effect
+                document.getElementById('capture-overlay').style.background = '#fff';
+                setTimeout(() => document.getElementById('capture-overlay').style.background = 'rgba(0,0,0,0.4)', 50);
+
+                // Take Snapshot
+                // Resize ke 640x480 agar ringan dikirim (sudah cukup untuk AI)
+                const targetWidth = 640;
+                const targetHeight = (video.videoHeight / video.videoWidth) * targetWidth;
+                canvas.width = targetWidth;
+                canvas.height = targetHeight;
+                
+                context.drawImage(video, 0, 0, targetWidth, targetHeight);
+                // Kompresi kualitas ke 0.7 (70%) agar payload kecil (< 100KB)
+                const imageData = canvas.toDataURL('image/jpeg', 0.7);
+
+                // Send to backend
+                try {
+                    const response = await fetch('/api/workers/capture-step', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Accept': 'application/json'
+                        },
+                        body: JSON.stringify({
+                            worker_id: workerId,
+                            worker_name: workerName,
+                            image: imageData,
+                            step: currentStep
+                        })
+                    });
+                    
+                    if (!response.ok) {
+                        throw new Error(`Server merespon dengan status ${response.status}. Mungkin sesi Anda habis, silakan refresh halaman.`);
+                    }
+
+                    const result = await response.json();
+                    if(!result.success) {
+                        alert('Kualitas Foto Kurang: ' + result.message);
+                        currentStep--; // Ulangi step ini
+                        continue;
+                    }
+
+                    if(result.done) {
+                        alert('Selamat! Registrasi Pekerja Berhasil.');
+                        closeCameraRegistration();
+                        loadWorkers();
+                        return;
+                    }
+                } catch (err) {
+                    console.error('Capture Error:', err);
+                    alert(`Gagal mengirim foto: ${err.message}\n\nSaran: Coba Refresh (F5) halaman dan login kembali.`);
+                    captureActive = false;
+                    return;
+                }
+            }
+            
+            captureActive = false;
+            updateCaptureUI();
+        }
+
         function startCamera(cameraId) {
             fetch(`/api/camera/${cameraId}/start`, {method: 'POST'})
                 .then(r => r.json())
@@ -2531,6 +3060,17 @@ DASHBOARD_TEMPLATE = """
                 });
         }
         
+        function openAddCameraModal() {
+            resetCameraForm();
+            document.getElementById('modal-title').innerText = 'Tambah Kamera Baru';
+            document.getElementById('camera-modal').classList.add('active');
+        }
+
+        function closeCameraModal() {
+            document.getElementById('camera-modal').classList.remove('active');
+            resetCameraForm();
+        }
+
         function addCamera() {
             const name = document.getElementById('camera-name').value;
             let source = document.getElementById('camera-source').value;
@@ -2543,7 +3083,7 @@ DASHBOARD_TEMPLATE = """
             }
             
             if (!name || !source) {
-                alert('Please fill in all required fields');
+                alert('Harap isi semua field yang diperlukan');
                 return;
             }
             
@@ -2564,11 +3104,10 @@ DASHBOARD_TEMPLATE = """
                 .then(r => r.json())
                 .then(data => {
                     if (data.success) {
-                        editingCameraId = null;
-                        resetCameraForm();
+                        closeCameraModal();
                         loadCameras();
                     } else {
-                        alert(data.error || 'Failed to save camera');
+                        alert(data.error || 'Gagal menyimpan kamera');
                     }
                 });
         }
@@ -2584,6 +3123,7 @@ DASHBOARD_TEMPLATE = """
         
         function editCamera(id, name, source) {
             editingCameraId = id;
+            document.getElementById('modal-title').innerText = 'Edit Kamera - CAM-' + id;
             document.getElementById('camera-name').value = name;
             
             const sourceSelect = document.getElementById('camera-source');
@@ -2604,6 +3144,7 @@ DASHBOARD_TEMPLATE = """
             }
             
             handleSourceChange();
+            document.getElementById('camera-modal').classList.add('active');
         }
         
         function deleteCamera(id) {
@@ -2655,6 +3196,129 @@ DASHBOARD_TEMPLATE = """
             }
         }, 5000);
         
+        function loadCaptures() {
+            const grid = document.getElementById('captures-grid');
+            if(!grid) return;
+            grid.innerHTML = '<div style="grid-column: 1/-1; text-align: center; padding: 40px; color: #888;">Loading captures...</div>';
+            
+            fetch('/api/captures')
+                .then(r => r.json())
+                .then(data => {
+                    grid.innerHTML = '';
+                    if (!data.captures || data.captures.length === 0) {
+                        grid.innerHTML = '<div style="grid-column: 1/-1; text-align: center; padding: 40px; color: #888;">No unknown captures found yet.</div>';
+                        return;
+                    }
+                    
+                    data.captures.forEach(c => {
+                        const card = document.createElement('div');
+                        card.className = 'card';
+                        card.style.padding = '16px';
+                        card.innerHTML = `
+                            <div style="aspect-ratio: 16/9; background: #000; border-radius: 8px; overflow: hidden; margin-bottom: 12px;">
+                                <img src="data:image/jpeg;base64,${c.preview}" style="width: 100%; height: 100%; object-fit: contain;">
+                            </div>
+                            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+                                <span style="font-weight: 700; color: var(--text-slate-50); font-size: 14px;">${c.id}</span>
+                                <span class="status-badge" style="background: rgba(99, 102, 241, 0.1); color: var(--primary); border: none;">${c.image_count} Foto</span>
+                            </div>
+                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
+                                <input type="text" id="name-${c.id}" placeholder="Nama Lengkap" class="form-group" style="padding: 8px; font-size: 12px; margin-bottom: 0; grid-column: 1/-1;">
+                                <input type="text" id="id-${c.id}" placeholder="Worker ID (W-XXX)" class="form-group" style="padding: 8px; font-size: 12px; margin-bottom: 0; grid-column: 1/-1;">
+                                <button class="btn-action btn-primary" data-action="register-capture" data-id="${c.id}" style="justify-content: center; padding: 8px;">Daftarkan</button>
+                                <button class="btn-action" data-action="delete-capture" data-id="${c.id}" style="justify-content: center; padding: 8px; color: #ff4d4d; border-color: rgba(255, 77, 77, 0.2); background: rgba(255, 77, 77, 0.05);">Hapus</button>
+                            </div>
+                        `;
+                        grid.appendChild(card);
+                    });
+                });
+        }
+
+        function registerFromCapture(tempId, btn) {
+            const name = document.getElementById('name-' + tempId).value;
+            const workerId = document.getElementById('id-' + tempId).value;
+            
+            if (!name || !workerId) {
+                alert('Harap isi Nama dan ID');
+                return;
+            }
+            
+            if (btn) {
+                btn.disabled = true;
+                btn.textContent = 'Mendaftarkan...';
+            }
+            
+            fetch('/api/register_from_capture', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    temp_id: tempId,
+                    worker_id: workerId,
+                    name: name
+                })
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    alert('Berhasil mendaftarkan pekerja!');
+                    loadCaptures();
+                } else {
+                    alert('Gagal: ' + data.message);
+                }
+            })
+            .catch(err => {
+                console.error('Registration Error:', err);
+                alert('Terjadi kesalahan: ' + err.message);
+            })
+            .finally(() => {
+                if (btn) {
+                    btn.disabled = false;
+                    btn.textContent = 'Daftarkan';
+                }
+            });
+        }
+
+        function deleteCapture(tempId) {
+            console.log('🗑️ Mencoba menghapus capture:', tempId);
+            if (!confirm('Apakah Anda yakin ingin menghapus data capture ' + tempId + '?')) return;
+            
+            fetch('/api/captures/' + tempId, {
+                method: 'DELETE'
+            })
+            .then(r => {
+                if (!r.ok) throw new Error('Server returned ' + r.status);
+                return r.json();
+            })
+            .then(data => {
+                if (data.success) {
+                    console.log('✅ Berhasil dihapus');
+                    loadCaptures();
+                } else {
+                    console.error('❌ Gagal hapus:', data.message);
+                    alert('Gagal menghapus: ' + data.message);
+                }
+            })
+            .catch(err => {
+                console.error('🌐 Network Error:', err);
+                alert('Terjadi kesalahan koneksi: ' + err.message);
+            });
+        }
+
+        // Delegated event listener for captures grid
+        document.addEventListener('click', (e) => {
+            const btn = e.target.closest('[data-action]');
+            if (!btn) return;
+            
+            const action = btn.dataset.action;
+            const id = btn.dataset.id;
+            
+            if (action === 'register-capture') {
+                registerFromCapture(id, btn);
+            } else if (action === 'delete-capture') {
+                deleteCapture(id);
+            }
+        });
+
         // Initialize when DOM is ready
         if (document.readyState === 'loading') {
             document.addEventListener('DOMContentLoaded', function() {
@@ -2678,7 +3342,7 @@ def login():
         username = request.form['username']
         password = request.form['password']
         
-        conn = sqlite3.connect('apd_monitoring.db')
+        conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         
         cursor.execute('SELECT * FROM users WHERE username = ?', (username,))
@@ -2713,12 +3377,95 @@ def dashboard():
     return render_template_string(DASHBOARD_TEMPLATE)
 
 # API routes
+@app.route('/api/workers/capture-step', methods=['POST'])
+def capture_worker_step():
+    """Handle a single step of guided camera capture"""
+    data = request.get_json()
+    worker_id = data.get('worker_id')
+    worker_name = data.get('worker_name')
+    image_data = data.get('image')
+    step = int(data.get('step', 0))
+    
+    if not all([worker_id, worker_name, image_data]):
+        return jsonify({'success': False, 'message': 'Data tidak lengkap'})
+
+    try:
+        # Decode image
+        import base64
+        import numpy as np
+        header, encoded = image_data.split(",", 1)
+        data_bytes = base64.b64decode(encoded)
+        nparr = np.frombuffer(data_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        # 1. Quality Check: Brightness
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        avg_brightness = np.mean(gray)
+        if avg_brightness < 40:
+            return jsonify({'success': False, 'message': 'Ruangan terlalu gelap. Mohon tambah pencahayaan.'})
+            
+        # 2. Quality Check: Face Detection
+        faces = detector.face_recognizer.detect_faces(img)
+        if not faces:
+            return jsonify({'success': False, 'message': 'Wajah tidak terdeteksi. Pastikan wajah masuk dalam kotak.'})
+            
+        # Pilih wajah terbesar
+        best_face = max(faces, key=lambda x: (x['bbox'][2]-x['bbox'][0]) * (x['bbox'][3]-x['bbox'][1]))
+        
+        # 3. Quality Check: Positioning (Wajah harus cukup besar > 150px)
+        fw = best_face['bbox'][2] - best_face['bbox'][0]
+        if fw < 150:
+            return jsonify({'success': False, 'message': 'Maju sedikit lagi ke arah kamera.'})
+
+        # Save to worker folder
+        temp_dir = os.path.join(PROJECT_ROOT, 'data', 'workers', worker_id)
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        filename = f"capture_{step}.jpg"
+        cv2.imwrite(os.path.join(temp_dir, filename), img)
+        
+        # If last step, trigger sync
+        if step == 9:
+            # Add to SQLite
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute('INSERT OR REPLACE INTO workers (worker_id, name) VALUES (?, ?)', (worker_id, worker_name))
+            conn.commit()
+            conn.close()
+            
+            # Sync recognition
+            detector.face_recognizer.register_worker(worker_id, worker_name, temp_dir)
+            return jsonify({'success': True, 'message': 'Registrasi selesai! Semua foto tersimpan.', 'done': True})
+
+        return jsonify({'success': True, 'message': f'Foto {step+1} berhasil diambil.', 'done': False})
+
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)})
+
+
 @app.route('/api/workers')
 def get_workers():
+    # Fetch from SQLite first (Source of Truth for Names)
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT worker_id, name, created_at FROM workers')
+    db_workers = {row[0]: {'name': row[1], 'created_at': row[2]} for row in cursor.fetchall()}
+    conn.close()
+    
+    workers_list = []
     if hasattr(detector, 'face_recognizer') and detector.face_recognizer:
-        workers = detector.face_recognizer.get_registered_workers()
-        return jsonify({'workers': workers})
-    return jsonify({'workers': []})
+        fr_workers = detector.face_recognizer.get_registered_workers()
+        for fw in fr_workers:
+            wid = fw['worker_id']
+            # Override name with DB name if available
+            if wid in db_workers:
+                fw['name'] = db_workers[wid]['name']
+                # If registration_date is missing from metadata, use created_at
+                if not fw.get('registration_date'):
+                    fw['registration_date'] = db_workers[wid]['created_at']
+            workers_list.append(fw)
+    
+    return jsonify({'workers': workers_list})
 
 @app.route('/api/workers/register', methods=['POST'])
 def register_worker():
@@ -2729,31 +3476,107 @@ def register_worker():
     if not worker_id or not name or not files:
         return jsonify({'success': False, 'message': 'Missing data'})
         
+    # Limit to max 10 photos
+    if len(files) > 10:
+        files = files[:10]
+        print(f"ℹ️ Limited upload to 10 photos for worker {worker_id}")
+        
     # Ensure FaceRecognizer is initialized
     if not hasattr(detector, 'face_recognizer') or not detector.face_recognizer:
         from src.face_recognition import FaceRecognitionSystem
         detector.face_recognizer = FaceRecognitionSystem()
         
     # Save files to a temporary folder
-    worker_folder = os.path.join('data', 'workers', worker_id)
+    # Use absolute path to avoid duplication in web_app subfolder
+    worker_folder = os.path.join(PROJECT_ROOT, 'data', 'workers', worker_id)
     os.makedirs(worker_folder, exist_ok=True)
     
     for f in files:
         if f.filename:
             f.save(os.path.join(worker_folder, f.filename))
             
-    # Register
+    # Register faces in Pickle
     success = detector.face_recognizer.register_worker(worker_id, name, worker_folder)
+    
     if success:
+        # Save to SQLite Workers table as source of truth
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO workers (worker_id, name) 
+                VALUES (?, ?)
+            ''', (worker_id, name))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"⚠️ Failed to save worker to SQLite: {e}")
+            
         detector.use_face_recognition = True
         return jsonify({'success': True})
     else:
         return jsonify({'success': False, 'message': 'Failed to extract face features from images'})
 
-@app.route('/api/workers/<worker_id>', methods=['DELETE'])
-def delete_worker(worker_id):
+@app.route('/api/workers/<worker_id>', methods=['PUT', 'DELETE'])
+def worker_detail_api(worker_id):
+    if request.method == 'PUT':
+        data = request.get_json() or {}
+        new_name = data.get('name')
+        if not new_name:
+            return jsonify({'success': False, 'error': 'Name is required'}), 400
+            
+        # 1. Update SQLite
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('UPDATE workers SET name = ? WHERE worker_id = ?', (new_name, worker_id))
+        conn.commit()
+        conn.close()
+        
+        # 2. Update Pickle
+        success = False
+        if hasattr(detector, 'face_recognizer') and detector.face_recognizer:
+            success = detector.face_recognizer.update_worker_name(worker_id, new_name)
+            
+        return jsonify({'success': success or True})
+        
+    elif request.method == 'DELETE':
+        # 1. Remove from SQLite
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM workers WHERE worker_id = ?', (worker_id,))
+        conn.commit()
+        conn.close()
+        
+        # 2. Remove from Pickle (Face Recognition Memory)
+        if hasattr(detector, 'face_recognizer') and detector.face_recognizer:
+            detector.face_recognizer.remove_worker(worker_id)
+            
+        # 3. Remove physical photo folder
+        worker_folder = os.path.join(PROJECT_ROOT, 'data', 'workers', worker_id)
+        if os.path.exists(worker_folder):
+            import shutil
+            try:
+                shutil.rmtree(worker_folder)
+            except Exception as e:
+                print(f"Error deleting folder: {e}")
+                
+        return jsonify({'success': True})
+
+    # DELETE logic
     if hasattr(detector, 'face_recognizer') and detector.face_recognizer:
+        # Remove from Pickle
         success = detector.face_recognizer.remove_worker(worker_id)
+        
+        # Remove from SQLite
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM workers WHERE worker_id = ?', (worker_id,))
+            conn.commit()
+            conn.close()
+        except:
+            pass
+
         if len(detector.face_recognizer.face_encodings) == 0:
             detector.use_face_recognition = False
         return jsonify({'success': success})
@@ -2761,7 +3584,7 @@ def delete_worker(worker_id):
 
 @app.route('/api/cameras')
 def get_cameras():
-    conn = sqlite3.connect('apd_monitoring.db')
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('SELECT * FROM cameras ORDER BY id')
     db_cameras = cursor.fetchall()
@@ -2791,7 +3614,7 @@ def add_camera():
     if isinstance(source, str):
         source = source.strip()
     
-    conn = sqlite3.connect('apd_monitoring.db')
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('INSERT INTO cameras (name, source) VALUES (?, ?)', (name, source))
     camera_id = cursor.lastrowid
@@ -2801,10 +3624,32 @@ def add_camera():
     # Keep camera inactive by default (lighter load). User can start manually.
     return jsonify({'success': True, 'camera_id': camera_id})
 
+@app.route('/api/settings', methods=['POST'])
+def save_settings():
+    global detection_cooldown
+    data = request.get_json() or {}
+    cooldown = data.get('cooldown')
+    confidence = data.get('confidence')
+    
+    if cooldown is not None:
+        try:
+            detection_cooldown = float(cooldown)
+        except ValueError:
+            pass
+            
+    if confidence is not None:
+        try:
+            detector.confidence_threshold = float(confidence)
+            print(f"🔧 Updated confidence threshold to {detector.confidence_threshold}")
+        except ValueError:
+            pass
+            
+    return jsonify({'success': True})
+
 @app.route('/api/camera/<int:camera_id>/start', methods=['POST'])
 def start_camera(camera_id):
     # Get camera info from database
-    conn = sqlite3.connect('apd_monitoring.db')
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('SELECT source FROM cameras WHERE id = ?', (camera_id,))
     result = cursor.fetchone()
@@ -2923,7 +3768,7 @@ def camera_detail(camera_id):
             return jsonify({'success': False, 'error': 'Name and source are required'}), 400
         
         # Update camera info in database
-        conn = sqlite3.connect('apd_monitoring.db')
+        conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute('UPDATE cameras SET name = ?, source = ? WHERE id = ?', (name, source, camera_id))
         conn.commit()
@@ -2940,7 +3785,7 @@ def camera_detail(camera_id):
     success = stop_camera_monitoring(camera_id)
     
     # Remove camera from database
-    conn = sqlite3.connect('apd_monitoring.db')
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('DELETE FROM cameras WHERE id = ?', (camera_id,))
     conn.commit()
@@ -2959,18 +3804,29 @@ def get_daily_stats():
     start_date = request.args.get('start')
     end_date = request.args.get('end')
     
-    conn = sqlite3.connect('apd_monitoring.db')
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    if start_date and end_date:
-        cursor.execute('''
+    conditions = []
+    params = []
+    
+    if start_date:
+        conditions.append("DATE(timestamp) >= ?")
+        params.append(start_date)
+    if end_date:
+        conditions.append("DATE(timestamp) <= ?")
+        params.append(end_date)
+        
+    if conditions:
+        query = f'''
             SELECT DATE(timestamp) as date, 
                    violation_type, 
                    COUNT(*) as count
             FROM violations 
-            WHERE DATE(timestamp) BETWEEN ? AND ?
+            WHERE {" AND ".join(conditions)}
             GROUP BY DATE(timestamp), violation_type
-        ''', (start_date, end_date))
+        '''
+        cursor.execute(query, params)
     else:
         # Last 7 days
         cursor.execute('''
@@ -3005,7 +3861,7 @@ def export_data():
     start_date = request.args.get('start')
     end_date = request.args.get('end')
     
-    conn = sqlite3.connect('apd_monitoring.db')
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
     query = '''
@@ -3015,9 +3871,16 @@ def export_data():
     '''
     params = []
     
-    if start_date and end_date:
-        query += ' WHERE DATE(v.timestamp) BETWEEN ? AND ?'
-        params.extend([start_date, end_date])
+    conditions = []
+    if start_date:
+        conditions.append("DATE(v.timestamp) >= ?")
+        params.append(start_date)
+    if end_date:
+        conditions.append("DATE(v.timestamp) <= ?")
+        params.append(end_date)
+        
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
     
     query += ' ORDER BY v.timestamp DESC'
     cursor.execute(query, params)
@@ -3027,66 +3890,107 @@ def export_data():
     if format_type == 'csv':
         import csv
         import io
-        
         output = io.StringIO()
         writer = csv.writer(output)
-        writer.writerow(['Time', 'Date', 'Camera', 'Violation Type', 'Person ID', 'Confidence'])
+        writer.writerow(['ID', 'Waktu', 'Tgl', 'Kamera', 'Pelanggaran', 'ID Pekerja', 'Kepercayaan'])
         
         for v in violations:
-            writer.writerow([
-                v[4],  # timestamp
-                v[4][:10],  # date part
-                v[6] or f"Camera {v[1]}",  # camera name
-                v[2].replace('no', 'No ').title(),  # violation type
-                f"PERSON-{v[0]}",  # person ID
-                f"{v[3]*100:.1f}%"  # confidence
-            ])
+            wid = v[8] if v[8] and v[8] not in ('', 'Unknown') else 'Unknown ID'
+            writer.writerow([v[0], v[5], v[5][:10], v[9] or f"Camera {v[1]}", v[2].replace('no', 'No ').title(), wid, f"{v[3]*100:.1f}%"])
         
-        response = app.response_class(
-            output.getvalue(),
-            mimetype='text/csv',
-            headers={'Content-Disposition': 'attachment; filename=violations.csv'}
-        )
+        response = app.response_class(output.getvalue(), mimetype='text/csv', headers={'Content-Disposition': 'attachment; filename=log_pelanggaran.csv'})
         return response
     
     elif format_type == 'excel':
-        # Simple Excel format (tab-separated)
-        output = "Time\tDate\tCamera\tViolation Type\tPerson ID\tConfidence\n"
+        import pandas as pd
+        import io
         
+        data = []
         for v in violations:
-            output += f"{v[4]}\t{v[4][:10]}\t{v[6] or f'Camera {v[1]}'}\t{v[2].replace('no', 'No ').title()}\tPERSON-{v[0]}\t{v[3]*100:.1f}%\n"
+            wid = v[8] if v[8] and v[8] not in ('', 'Unknown') else 'Unknown ID'
+            data.append({
+                'ID': v[0],
+                'Waktu': v[5],
+                'Tgl': v[5][:10],
+                'Kamera': v[9] or f"Camera {v[1]}",
+                'Jenis Pelanggaran': v[2].replace('no', 'No ').title(),
+                'ID Pekerja': wid,
+                'Confidence': f"{v[3]*100:.1f}%"
+            })
         
-        response = app.response_class(
-            output,
-            mimetype='text/tab-separated-values',
-            headers={'Content-Disposition': 'attachment; filename=violations.txt'}
-        )
+        df = pd.DataFrame(data)
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, sheet_name='Log Pelanggaran')
+            # Styling via openpyxl could be added here if needed, but basic df.to_excel is already a real table
+        
+        response = app.response_class(output.getvalue(), mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', headers={'Content-Disposition': 'attachment; filename=log_pelanggaran.xlsx'})
         return response
     
     elif format_type == 'pdf':
-        # Simple PDF-like text format
-        output = "APD VIOLATION REPORT\n"
-        output += "=" * 50 + "\n\n"
+        from fpdf import FPDF
+        import io
         
-        if start_date and end_date:
-            output += f"Period: {start_date} to {end_date}\n\n"
+        class PDF(FPDF):
+            def header(self):
+                self.set_font('helvetica', 'B', 16)
+                self.cell(0, 10, 'LAPORAN REAL-TIME MONITORING APD', ln=True, align='C')
+                self.set_font('helvetica', 'I', 10)
+                self.cell(0, 10, 'Sistem Pengawasan Keselamatan Kerja Terautomasi', ln=True, align='C')
+                self.ln(10)
+            def footer(self):
+                self.set_y(-15)
+                self.set_font('helvetica', 'I', 8)
+                self.cell(0, 10, f'Halaman {self.page_no()}', align='C')
         
-        output += f"Total Violations: {len(violations)}\n\n"
-        output += "-" * 30 + "\n"
+        pdf = PDF()
+        pdf.add_page()
+        pdf.set_font('helvetica', '', 10)
         
-        for v in violations:
-            output += f"Time: {v[4]}\n"
-            output += f"Camera: {v[6] or f'Camera {v[1]}'}\n"
-            output += f"Type: {v[2].replace('no', 'No ').title()}\n"
-            output += f"Person: PERSON-{v[0]}\n"
-            output += f"Confidence: {v[3]*100:.1f}%\n"
-            output += "-" * 20 + "\n"
+        # Metadata
+        pdf.cell(0, 10, f"Dicetak pada: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ln=True)
+        pdf.cell(0, 10, f"Total Pelanggaran: {len(violations)}", ln=True)
+        pdf.ln(5)
         
-        response = app.response_class(
-            output,
-            mimetype='text/plain',
-            headers={'Content-Disposition': 'attachment; filename=violations_report.txt'}
-        )
+        # Table Header
+        pdf.set_fill_color(240, 240, 240)
+        pdf.set_font('helvetica', 'B', 10)
+        col_widths = [10, 40, 35, 40, 30, 25]
+        headers = ['No', 'Waktu', 'Lokasi', 'Pelanggaran', 'ID Pekerja', 'Konf.']
+        
+        for i in range(len(headers)):
+            pdf.cell(col_widths[i], 10, headers[i], border=1, fill=True, align='C')
+        pdf.ln()
+        
+        # Table Body
+        pdf.set_font('helvetica', '', 9)
+        for i, v in enumerate(violations):
+            wid = v[8] if v[8] and v[8] not in ('', 'Unknown') else 'Unknown'
+            # id(0) camera_id(1) violation_type(2) confidence(3) bbox(4) timestamp(5) image_path(6) processed(7) worker_id(8), camera_name(9)
+            row = [
+                str(i+1),
+                v[5][:19], # timestamp
+                v[9] or f"Cam {v[1]}",
+                v[2].replace('no', 'No ').title(),
+                wid,
+                f"{v[3]*100:.0f}%"
+            ]
+            
+            # Check for page break
+            if pdf.get_y() > 260:
+                pdf.add_page()
+                # Re-add headers
+                pdf.set_font('helvetica', 'B', 10)
+                for j in range(len(headers)):
+                    pdf.cell(col_widths[j], 10, headers[j], border=1, fill=True, align='C')
+                pdf.ln()
+                pdf.set_font('helvetica', '', 9)
+                
+            for j in range(len(row)):
+                pdf.cell(col_widths[j], 10, row[j], border=1, align='C')
+            pdf.ln()
+            
+        response = app.response_class(pdf.output(), mimetype='application/pdf', headers={'Content-Disposition': 'attachment; filename=laporan_pelanggaran.pdf'})
         return response
     
     return jsonify({'error': 'Unsupported format'}), 400
@@ -3095,55 +3999,132 @@ def export_data():
 def get_statistics():
     global global_stats
     
-    # Also get violation counts from database for accuracy
-    conn = sqlite3.connect('apd_monitoring.db')
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute('SELECT violation_type, COUNT(*) FROM violations GROUP BY violation_type')
-    violation_counts = dict(cursor.fetchall())
     
     # Get active cameras count
     cursor.execute("SELECT COUNT(*) FROM cameras WHERE status = 'active'")
     active_cameras_db = cursor.fetchone()[0]
+    
+    # --- Ambil Angka Total dari Database (agar sinkron dengan Log) ---
+    cursor.execute("SELECT COUNT(*) FROM violations")
+    total_violations_db = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM violations WHERE violation_type = 'nohelmet'")
+    no_helmet_count_db = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM violations WHERE violation_type = 'novest'")
+    no_vest_count_db = cursor.fetchone()[0]
+    
+    # --- Rata-rata Akurasi APD Detection ---
+    cursor.execute('''
+        SELECT AVG(confidence) FROM violations
+        WHERE violation_type IN ('nohelmet', 'novest')
+    ''')
+    row = cursor.fetchone()
+    avg_apd_accuracy = round((row[0] or 0.0) * 100, 1)
+    
+    # --- Rata-rata Akurasi Face Recognition ---
+    avg_face_accuracy = 0.0
+    try:
+        cursor.execute('SELECT AVG(similarity) FROM face_recognition_log')
+        row_face = cursor.fetchone()
+        if row_face and row_face[0] is not None:
+            avg_face_accuracy = round(row_face[0] * 100, 1)
+    except Exception:
+        pass
+    
     conn.close()
     
     return jsonify({
-        'total_violations': global_stats['total_violations'],
-        'no_helmet_count': global_stats['no_helmet_count'],
-        'no_vest_count': global_stats['no_vest_count'],
-        'active_cameras': global_stats['active_cameras']
+        'total_violations': total_violations_db,
+        'no_helmet_count': no_helmet_count_db,
+        'no_vest_count': no_vest_count_db,
+        'active_cameras': active_cameras_db,
+        'avg_apd_accuracy': avg_apd_accuracy,
+        'avg_face_accuracy': avg_face_accuracy
     })
 
 @app.route('/api/violations')
 def get_violations():
-    conn = sqlite3.connect('apd_monitoring.db')
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute('''
-        SELECT v.*, c.name as camera_name 
-        FROM violations v 
-        LEFT JOIN cameras c ON v.camera_id = c.id 
-        ORDER BY v.timestamp DESC 
-        LIMIT 100
-    ''')
+
+    start_date = request.args.get('start', '')
+    end_date   = request.args.get('end', '')
+
+    query = '''
+        SELECT v.id, v.camera_id, v.violation_type, v.confidence,
+               v.timestamp, v.processed, v.worker_id,
+               c.name as camera_name
+        FROM violations v
+        LEFT JOIN cameras c ON v.camera_id = c.id
+    '''
+    conditions = []
+    params = []
+    if start_date:
+        conditions.append("DATE(v.timestamp) >= ?")
+        params.append(start_date)
+    if end_date:
+        conditions.append("DATE(v.timestamp) <= ?")
+        params.append(end_date)
+        
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+        
+    query += ' ORDER BY v.timestamp DESC LIMIT 100'
+
+    cursor.execute(query, params)
     violations = cursor.fetchall()
     conn.close()
-    
+
     violation_list = []
     for v in violations:
+        # v: id(0) camera_id(1) violation_type(2) confidence(3)
+        #    timestamp(4) processed(5) worker_id(6) camera_name(7)
+        worker_id = v[6] if v[6] and v[6] != '' else 'Unknown ID'
         violation_list.append({
-            'id': v[0],
-            'camera_id': v[1],
-            'violation_type': v[2],
-            'confidence': v[3],
-            'timestamp': v[5],
-            'camera_name': v[7] or 'Unknown',
-            'processed': bool(v[6])
+            'id':            v[0],
+            'camera_id':     v[1],
+            'violation_type':v[2],
+            'confidence':    v[3],
+            'timestamp':     v[4],
+            'processed':     bool(v[5]),
+            'worker_id':     worker_id,
+            'camera_name':   v[7] or f'Camera {v[1]}',
         })
-    
+
     return jsonify({'violations': violation_list})
+    
+@app.route('/api/violations/reset', methods=['POST'])
+def reset_violations():
+    """Clear all violations and face recognition statistics"""
+    global global_stats
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        # Clear tables
+        cursor.execute("DELETE FROM violations")
+        cursor.execute("DELETE FROM face_recognition_log")
+        
+        conn.commit()
+        conn.close()
+        
+        # Reset in-memory stats too
+        global_stats['total_violations'] = 0
+        global_stats['no_helmet_count'] = 0
+        global_stats['no_vest_count'] = 0
+        
+        print("🧹 [DB] Statistik dan Log Pelanggaran telah direset.")
+        return jsonify({'success': True, 'message': 'Data statistik berhasil direset'})
+    except Exception as e:
+        print(f"❌ [DB] Error saat mereset data: {e}")
+        return jsonify({'success': False, 'message': str(e)})
 
 @app.route('/api/violations/export')
 def export_violations():
-    conn = sqlite3.connect('apd_monitoring.db')
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('''
         SELECT v.*, c.name as camera_name 
@@ -3182,6 +4163,94 @@ def export_violations():
 def camera_feed(camera_id):
     return Response(generate_camera_feed(camera_id),
                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/api/captures')
+def get_captures():
+    captures_path = os.path.join(PROJECT_ROOT, "data", "captures")
+    if not os.path.exists(captures_path):
+        return jsonify({'captures': []})
+    
+    captures = []
+    for temp_id in os.listdir(captures_path):
+        temp_dir = os.path.join(captures_path, temp_id)
+        if os.path.isdir(temp_dir):
+            images = [img for img in os.listdir(temp_dir) if img.endswith(('.jpg', '.jpeg', '.png'))]
+            if images:
+                # Convert first image to base64 for preview
+                try:
+                    with open(os.path.join(temp_dir, images[0]), "rb") as image_file:
+                        encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+                except:
+                    encoded_string = ""
+                
+                captures.append({
+                    'id': temp_id,
+                    'image_count': len(images),
+                    'preview': encoded_string
+                })
+    
+    return jsonify({'captures': captures})
+
+@app.route('/api/register_from_capture', methods=['POST'])
+def register_from_capture():
+    data = request.json
+    temp_id = data.get('temp_id')
+    worker_id = data.get('worker_id')
+    name = data.get('name')
+    
+    if not all([temp_id, worker_id, name]):
+        return jsonify({'success': False, 'message': 'Missing data'})
+    
+    temp_dir = os.path.join(PROJECT_ROOT, "data/captures", temp_id)
+    if not os.path.exists(temp_dir):
+        return jsonify({'success': False, 'message': 'Capture folder not found'})
+    
+    # Register to Face Recognition System
+    if detector.face_recognizer:
+        success = detector.face_recognizer.register_worker(worker_id, name, temp_dir)
+        if success:
+            # Add to SQLite database
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute('INSERT OR IGNORE INTO workers (worker_id, name) VALUES (?, ?)', (worker_id, name))
+            conn.commit()
+            conn.close()
+            
+            # Delete temp folder
+            try:
+                import shutil
+                shutil.rmtree(temp_dir)
+            except Exception as e:
+                print(f"⚠️ [PENTING] Gagal menghapus folder sementara {temp_id}: {str(e)}")
+            
+            # Sync back to detector if needed
+            detector.use_face_recognition = True
+            
+            return jsonify({'success': True, 'message': f'Worker {name} registered successfully'})
+        else:
+            return jsonify({'success': False, 'message': 'Failed to register with face recognition system'})
+            
+    return jsonify({'success': False, 'message': 'Face recognition system not available'})
+
+@app.route('/api/captures/<temp_id>', methods=['DELETE'])
+def delete_capture(temp_id):
+    capture_id = temp_id.replace('..', '')
+    print(f"🗑️ [API] Permintaan hapus capture: {capture_id}")
+    
+    import shutil
+    temp_dir = os.path.join(PROJECT_ROOT, "data/captures", capture_id)
+    
+    try:
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+            print(f"✅ [API] Berhasil menghapus: {temp_dir}")
+            return jsonify({'success': True})
+        else:
+            print(f"⚠️ [API] Folder tidak ditemukan: {temp_dir}")
+            return jsonify({'success': False, 'message': 'Folder tidak ditemukan'})
+    except Exception as e:
+        print(f"❌ [API] Error saat menghapus folder: {str(e)}")
+        return jsonify({'success': False, 'message': f'Error sistem: {str(e)}'})
 
 if __name__ == '__main__':
     import socket

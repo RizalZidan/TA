@@ -26,7 +26,7 @@ class ScalingConfig:
         }
         
         # Default configuration
-        self.use_smart_scaling = False
+        self.use_smart_scaling = True
         self.show_scaling_info = True
         
         print("📏 Scaling Configuration initialized")

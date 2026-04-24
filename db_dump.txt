@@ -1,0 +1,76 @@
+ID: 1
+NAME: '1'
+SOURCE: '0'
+--------------------
+ID: 2
+NAME: 'cctv1'
+SOURCE: 'rtsp://172.19.155.173:8554/cam'
+--------------------
+ID: 3
+NAME: 'cctv1'
+SOURCE: 'rtsp://service:cctv@172.19.156.152/live.sdp'
+--------------------
+ID: 4
+NAME: 'cctv1'
+SOURCE: 'rtsp://service:cctv@192.168.0.172/live.sdp'
+--------------------
+ID: 5
+NAME: 'cctv1'
+SOURCE: 'rtsp://service:cctv@172.19.156.152/live.sdp'
+--------------------
+ID: 6
+NAME: 'cctv1'
+SOURCE: 'rtsp://service:cctv@172.19.156.152/live.sdp'
+--------------------
+ID: 7
+NAME: 'cctv1'
+SOURCE: 'rtsp://service:cctv@172.19.156.152/live.sdp'
+--------------------
+ID: 8
+NAME: 'camera web'
+SOURCE: '0'
+--------------------
+ID: 9
+NAME: 'camera web'
+SOURCE: '0'
+--------------------
+ID: 10
+NAME: 'camera web'
+SOURCE: '0'
+--------------------
+ID: 11
+NAME: 'camera web'
+SOURCE: '0'
+--------------------
+ID: 12
+NAME: 'camera web'
+SOURCE: '0'
+--------------------
+ID: 13
+NAME: 'camera web'
+SOURCE: '0'
+--------------------
+ID: 14
+NAME: 'camera web'
+SOURCE: '0'
+--------------------
+ID: 15
+NAME: 'camera web'
+SOURCE: '0'
+--------------------
+ID: 16
+NAME: 'main'
+SOURCE: '0'
+--------------------
+ID: 17
+NAME: 'mainaa'
+SOURCE: 'http://192.168.100.95:5001/vidio_feed'
+--------------------
+ID: 18
+NAME: 'CCTV4'
+SOURCE: 'rtsp://192.168.0.172:8554/cam'
+--------------------
+ID: 19
+NAME: 'HAHHAHA'
+SOURCE: 'rtsp://192.168.0.172:8554/cam'
+--------------------

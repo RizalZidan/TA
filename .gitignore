@@ -3,35 +3,30 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+.env
+.venv
+env/
+venv/
+build/
+dist/
 
-# YOLO Model
-*.pt
-*.weights
+# Large AI Data & Models
+data/workers/*
+!data/workers/.gitkeep
+data/captures/*
+!data/captures/.gitkeep
+data/*.db
+data/*.pkl
+models/*.pt
+models/*.onnx
+experiments/*/runs/
+experiments/*/datasets/
+runs/
 
-# Dataset
-*.jpg
-*.jpeg
-*.png
-*.txt
-
-# Database
-*.db
-*.sqlite
-*.sqlite3
-
-# IDE
+# Logs & Misc
+*.log
+error_log.txt
 .vscode/
 .idea/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Logs
-*.log
-
-# Temporary files
-*.tmp
-*.temp
+.ipynb_checkpoints/
+scratch/

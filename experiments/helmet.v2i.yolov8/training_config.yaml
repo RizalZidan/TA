@@ -1,0 +1,53 @@
+# YOLOv8 Training Configuration for Helmet and Vest Detection
+
+# Dataset Configuration
+data_path: data.yaml  # Path to data.yaml relative to this script
+
+# Training Parameters
+epochs: 50
+batch_size: 16
+image_size: 640
+workers: 4
+
+# Model Configuration
+model: yolov8n.pt  # Use nano model for faster training
+pretrained: true
+
+# Learning Rate Settings
+lr0: 0.01
+lrf: 0.01
+momentum: 0.937
+weight_decay: 0.0005
+warmup_epochs: 3
+
+# Loss Weights
+box_weight: 7.5
+cls_weight: 0.5
+dfl_weight: 1.5
+
+# Augmentation Configuration (Standard YOLOv8 Parameters)
+augmentations:
+  hsv_h: 0.015   # image HSV-Hue augmentation (fraction)
+  hsv_s: 0.7     # image HSV-Saturation augmentation (fraction)
+  hsv_v: 0.4     # image HSV-Value augmentation (fraction)
+  degrees: 90.0  # image rotation (+/- deg)
+  translate: 0.1 # image translation (+/- fraction)
+  scale: 0.5     # image scale (+/- gain)
+  shear: 0.0     # image shear (+/- deg)
+  perspective: 0.0 # image perspective (+/- fraction), range 0-0.001
+  flipud: 0.5    # image flip up-down (probability)
+  fliplr: 0.5    # image flip left-right (probability)
+  mosaic: 1.0    # image mosaic (probability)
+  mixup: 0.0     # image mixup (probability)
+  copy_paste: 0.0 # segment copy-paste (probability)
+  auto_augment: randaugment # auto augmentation policy
+  erasing: 0.4   # random erasing (probability)
+
+# Hardware Configuration
+device: 0  # GPU device (e.g. 0), use 'cpu' for CPU training
+
+# Output Configuration
+project: apd_training_tests
+name: yolov8n_30epochs_latest
+save_period: 10  # Save model every 10 epochs
+exist_ok: true
