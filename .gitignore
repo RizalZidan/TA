@@ -30,3 +30,17 @@ error_log.txt
 .idea/
 .ipynb_checkpoints/
 scratch/
+
+# Large Files & Untracked Dirs
+*.mp4
+*.zip
+*.pt
+artifacts/
+skripsi/
+rtsp_test/
+test_rtsp.py
+web_app/data/captures/
+experiments/*/train/
+experiments/*/valid/
+experiments/*/test/
+*.backup

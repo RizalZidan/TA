@@ -1,0 +1,14 @@
+path: F:\TA\experiments\helmet-vest.v2i.yolov8
+train: train/images
+val: valid/images
+test: test/images
+
+nc: 2
+names: ['helmet', 'vest']
+
+roboflow:
+  workspace: arman-keresh-lbrre
+  project: helmet-vest-0lcu5
+  version: 2
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/arman-keresh-lbrre/helmet-vest-0lcu5/dataset/2

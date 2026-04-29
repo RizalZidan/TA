@@ -38,15 +38,15 @@ class ViolationsDetector:
         self.confidence_threshold = confidence_threshold
         
         # Determine target path
-        helmet_v2_path = os.path.join(os.path.dirname(__file__), "..", "experiments/helmet.v2i.yolov8/helmet_vest_detection/yolov8n_50epochs_augmented/weights/best.pt")
-        new_retrained_model = os.path.join(os.path.dirname(__file__), "..", "experiments/PPE_Combined_Dataset/runs/ppe_retraining_30_epochs/weights/best.pt")
+        ppe_combined_path = os.path.join(os.path.dirname(__file__), "..", "experiments/apd_finetuned/best.pt")
+        helmet_v2_path = os.path.join(os.path.dirname(__file__), "..", "experiments/helmet_v2_training_50ep/weights/best.pt")
         premier_model_path = os.path.join(os.path.dirname(__file__), "..", "models/yolov8_50_epoch/best.pt")
         
-        # Priority: 1. Helmet v2 (User requested), 2. Retrained, 3. Premier
+        # Priority: 1. Helmet v2 (Requested), 2. PPE Combined, 3. Premier
         if os.path.exists(helmet_v2_path):
             target_path = helmet_v2_path
-        elif os.path.exists(new_retrained_model):
-            target_path = new_retrained_model
+        elif os.path.exists(ppe_combined_path):
+            target_path = ppe_combined_path
         else:
             target_path = premier_model_path
         
@@ -63,14 +63,14 @@ class ViolationsDetector:
                 self.class_names = {0: 'helmet', 1: 'vest'}
                 self.use_apd_model = False
                 self.model_label = "Helmet v2 (2-Class)"
-            elif "ppe_retraining" in target_path.lower():
-                self.class_names = {0: 'helmet', 1: 'no helmet', 2: 'person', 3: 'vest', 4: 'no vest'}
+            elif "combined" in target_path.lower() or "ppe_retraining" in target_path.lower() or "finetuned" in target_path.lower():
+                self.class_names = {0: 'helmet', 1: 'no helmet', 2: 'vest', 3: 'no vest'}
                 self.use_apd_model = True
-                self.model_label = "Retrained v2 (30 Ep)"
+                self.model_label = "PPE Combined (4-Class)"
             else:
                 self.class_names = {0: 'helmet', 1: 'no helmet', 2: 'person', 3: 'vest', 4: 'no vest'}
                 self.use_apd_model = True
-                self.model_label = "Combined Model"
+                self.model_label = "Default Model (5-Class)"
                 
             print(f"📊 Running in {self.model_label} mode")
         else:
@@ -104,6 +104,13 @@ class ViolationsDetector:
         self.captures_path = "data/captures"
         os.makedirs(self.captures_path, exist_ok=True)
         
+        # --- Temporal Detection Cache ---
+        # Short TTL (5 frames) to prevent false positives from persisting too long
+        self._det_cache = []      # cached violation entries
+        self._det_age   = 0       # frames since last real detection
+        self.CACHE_TTL  = 5       # ~0.15s at 30fps - short enough to avoid locking false positives
+
+        
         try:
             from src.face_recognition import FaceRecognitionSystem
             self.face_recognizer = FaceRecognitionSystem()
@@ -120,7 +127,38 @@ class ViolationsDetector:
         print(f"🎯 Confidence threshold: {float(self.confidence_threshold):.3f}")
         print("⚡ Performance optimizations enabled")
     
-    def detect_violations(self, frame):
+    def set_roi(self, polygon_ratios):
+        """
+        Set Region of Interest polygon.
+        polygon_ratios: list of (x_ratio, y_ratio) from 0.0 to 1.0
+        e.g. [(0.4, 0.0), (1.0, 0.0), (1.0, 1.0), (0.4, 1.0)] = right 60% of frame
+        Set to None to disable ROI masking.
+        """
+        self.roi_polygon = polygon_ratios
+        if polygon_ratios:
+            print(f"🗺️ ROI set with {len(polygon_ratios)} points")
+        else:
+            print("🗺️ ROI cleared (full frame)")
+
+    def _point_in_roi(self, cx_ratio, cy_ratio):
+        """Check if a point (as ratio 0-1) is inside the ROI polygon using ray casting."""
+        if not self.roi_polygon:
+            return True  # No ROI = accept everything
+        import math
+        poly = self.roi_polygon
+        n  = len(poly)
+        inside = False
+        px, py = cx_ratio, cy_ratio
+        j = n - 1
+        for i in range(n):
+            xi, yi = poly[i]
+            xj, yj = poly[j]
+            if ((yi > py) != (yj > py)) and (px < (xj - xi) * (py - yi) / (yj - yi + 1e-9) + xi):
+                inside = not inside
+            j = i
+        return inside
+
+    def detect_violations(self, frame, enable_face_anchor=False):
         """
         Detect APD violations only (No_Helmet, No_Vest) - Optimized with smart scaling
         
@@ -153,8 +191,9 @@ class ViolationsDetector:
         except:
             pass
             
-        # --- RULE 6: Confidence threshold 0.30 (Lowered for better responsiveness) ---
-        CONF_THRESHOLD = 0.30
+        # --- Dual threshold: lower for positive APD, higher for violation detection ---
+        APD_CONF       = 0.38  # For helm/vest positive detection (raised to reduce false positives)
+        VIOLATION_CONF = 0.45  # For no_helmet/no_vest (higher = less false alarm)
         
         # 1. Get raw detections
         raw_results = self.model(frame_infer, verbose=False)
@@ -171,25 +210,101 @@ class ViolationsDetector:
                 cid = int(b.cls[0].cpu().numpy())
                 cname = self.class_names.get(cid, 'unknown').lower().replace('_', ' ')
                 bbox = b.xyxy[0].cpu().numpy().tolist()
-                
-                # if conf > 0.10: # Silenced for performance
-                #    print(f"🔍 AI RAW: [{cname}] conf: {conf:.3f} | class_id: {cid}")
 
-                if conf < CONF_THRESHOLD: continue
-                
+                # Apply dual threshold: violations need higher confidence
                 if cname == 'person':
+                    # Person needs extremely high confidence (0.88) to avoid ghost detections
+                    if conf < 0.88:
+                        continue
                     persons.append({'bbox': bbox, 'conf': conf})
                 else:
+                    is_violation_class = 'no' in cname  # 'no helmet' or 'no vest'
+                    threshold = VIOLATION_CONF if is_violation_class else APD_CONF
+                    if conf < threshold:
+                        continue
                     apd_items.append({'class': cname, 'bbox': bbox, 'conf': conf})
                     
         # If model doesn't include 'person', use dedicated person_model
-        if not persons and self.person_model:
-            p_results = self.person_model(frame_infer, conf=0.30, classes=[0], verbose=False)
+        # ALWAYS run person_model to catch ALL people
+        if self.person_model:
+            # Threshold ditingkatkan ke 0.90: ekstrim tinggi untuk menolak halusinasi benda mati (Prioritas 3)
+            p_results = self.person_model(frame_infer, conf=0.90, classes=[0], verbose=False)
             for pr in p_results:
                 for b in pr.boxes:
-                    persons.append({'bbox': b.xyxy[0].cpu().numpy().tolist(), 'conf': float(b.conf[0].cpu().numpy())})
+                    new_bbox = b.xyxy[0].cpu().numpy().tolist()
+                    new_conf = float(b.conf[0].cpu().numpy())
+                    
+                    bw = new_bbox[2] - new_bbox[0]
+                    bh = new_bbox[3] - new_bbox[1]
+                    
+                    # Filter 1: Too small
+                    if bw < 25 or bh < 50:
+                        continue
+                    
+                    # Filter 2: Minimum area (3000 px²) — rejects very thin/small detections
+                    if bw * bh < 3000:
+                        continue
+                    
+                    # Filter 3: Aspect ratio — real people are significantly taller than wide
+                    # h/w < 1.35 akan memblokir struktur lebar horizontal
+                    # h/w > 4.0 akan memblokir struktur kurus vertikal (seperti tiang/jeruji turnstile)
+                    if bw > 0:
+                        ratio = bh / bw
+                        if ratio < 1.35 or ratio > 4.0:
+                            continue
+                    
+                    # Deduplicate via IoU
+                    is_duplicate = False
+                    for existing in persons:
+                        if self._iou(new_bbox, existing['bbox']) > 0.4:
+                            is_duplicate = True
+                            break
+                    
+                    if not is_duplicate:
+                        persons.append({'bbox': new_bbox, 'conf': new_conf})
+        
+        # --- RESCUE WEBCAM PERSON: Gunakan Face Detector sebagai Anchor Person ---
+        # Karena YOLO person_model sering ngawur (menangkap bayangan/sisi wajah) jika wajah terlalu dekat ke webcam
+        if self.use_face_recognition and enable_face_anchor:
+            try:
+                found_faces = self.face_recognizer.detect_faces(frame_infer)
+                for f in found_faces:
+                    fx1, fy1, fx2, fy2 = f['bbox']
+                    fw = fx2 - fx1
+                    fh = fy2 - fy1
+                    # Validasi ukuran minimum absolut
+                    if fw < 25 or fh < 25: continue
+                    
+                    # Buat virtual person bbox berdasarkan proporsi manusia sungguhan
+                    virtual_pb = [
+                        max(0, fx1 - fw * 0.9),
+                        max(0, fy1 - fh * 0.6),
+                        min(frame_infer.shape[1], fx2 + fw * 0.9),
+                        min(frame_infer.shape[0], fy2 + fh * 3.5)
+                    ]
+                    
+                    is_dup = False
+                    for existing in persons:
+                        # Jika YOLO menangkap objek di lokasi wajah ini, timpa dengan bentuk virtual yang rapi
+                        if self._iou(virtual_pb, existing['bbox']) > 0.05:
+                            existing['bbox'] = virtual_pb
+                            existing['conf'] = max(existing['conf'], f['confidence'])
+                            is_dup = True
+                            break
+                    
+                    if not is_dup:
+                        # CCTV FIX: Mencegah detektor wajah berhalusinasi melihat muka di pagar/turnstile CCTV.
+                        # Face Anchor HANYA boleh aktif untuk CLOSE-UP Webcam (wajah sangat besar).
+                        # Jika wajah di bawah 150 pixel, biarkan YOLO yang mendeteksi badannya!
+                        if fw > 150 and f['confidence'] > 0.80:
+                            persons.append({'bbox': virtual_pb, 'conf': f['confidence']})
+            except Exception as e:
+                print(f"[DEBUG] Error di Face Anchor: {e}")
         
         violations = []
+        # Track which APD items got matched to a person
+        for item in apd_items:
+            item['grouped'] = False
         
         # --- RULE 1: Group detections by person ---
         for p in persons:
@@ -200,10 +315,14 @@ class ViolationsDetector:
             has_no_helmet_box = None
             has_vest = False
             has_no_vest_box = None
+            matched_any_apd = False
             
             # Find all APD items associated with this person
             for item in apd_items:
-                if self._is_inside(item['bbox'], pb):
+                itype = 'head' if 'helmet' in item['class'] else 'torso'
+                if self._is_inside(item['bbox'], pb, type=itype):
+                    item['grouped'] = True
+                    matched_any_apd = True
                     # --- RULE 5: Priority Rule ---
                     if item['class'] == 'helmet':
                         has_helmet = True
@@ -217,34 +336,91 @@ class ViolationsDetector:
                             has_no_vest_box = item
             
             # --- RULE 2 & 3: PPE Evaluation & Violation Criteria ---
-            # Rule: If "helmet" exists -> ignore "no helmet"
+            # Only report violations when there is EXPLICIT APD model evidence.
             if has_helmet:
                 violations.append(self._create_violation_entry(frame, pb, 'helmet_ok', 1.0, is_proxy=True))
-            else:
-                # If using 4-class model, we have explicit 'no helmet' detection
-                if has_no_helmet_box:
-                    violations.append(self._create_violation_entry(frame, pb, 'nohelmet', has_no_helmet_box['conf'], is_proxy=True))
-                # If using 2-class model, absence of 'helmet' IS the violation
-                elif not self.use_apd_model:
+            elif has_no_helmet_box:
+                violations.append(self._create_violation_entry(frame, pb, 'nohelmet', has_no_helmet_box['conf'], is_proxy=True))
+            elif not self.use_apd_model:
+                # 2-class model only: Guard Langkah 3 (Jangan vonis jika tidak yakin itu orang!)
+                if matched_any_apd or p['conf'] > 0.90:
                     violations.append(self._create_violation_entry(frame, pb, 'nohelmet', p['conf'], is_proxy=True))
+            elif not matched_any_apd and p['conf'] > 0.90:
+                # Person detected with very high confidence but ZERO APD items found
+                # Only trigger when extremely sure it's a real person (conf > 0.90)
+                violations.append(self._create_violation_entry(frame, pb, 'nohelmet', p['conf'] * 0.65, is_proxy=True))
+                violations.append(self._create_violation_entry(frame, pb, 'novest', p['conf'] * 0.65, is_proxy=True))
 
-            # Rule: If "vest" exists -> ignore "no vest"
             if has_vest:
                 violations.append(self._create_violation_entry(frame, pb, 'vest_ok', 1.0, is_proxy=True))
-            else:
-                if has_no_vest_box:
-                    violations.append(self._create_violation_entry(frame, pb, 'novest', has_no_vest_box['conf'], is_proxy=True))
-                elif not self.use_apd_model:
+            elif has_no_vest_box:
+                violations.append(self._create_violation_entry(frame, pb, 'novest', has_no_vest_box['conf'], is_proxy=True))
+            elif not self.use_apd_model:
+                # Guard Langkah 3
+                if matched_any_apd or p['conf'] > 0.90:
                     violations.append(self._create_violation_entry(frame, pb, 'novest', p['conf'], is_proxy=True))
+
+        # --- RESCUE LOGIC: Handle APD items with no matched person ---
+        # CRITICAL: Only rescue POSITIVE classes (helmet/vest detected).
+        # NEVER rescue negative classes (no helmet/no vest) without a real person anchor -
+        # this is the main cause of false positives on turnstiles/barriers/background.
+        for item in apd_items:
+            if item.get('grouped', False):
+                continue  # Already handled by a real person
             
-            # --- RULE 4: Compliant workers -> DO NOT return anything ---
-            # (Handled: we only append to violations list if PPE is missing)
+            item_class = item['class']
             
-            # --- RULE 7: FACE RECOGNITION INTEGRATION ---
-            # If ANY violation exists for this person, their 'person' bbox is already part of the violation entry.
-            # If no violations, we don't return anything, but tracking in app_advanced still runs.
+            # Skip violation classes (no helmet / no vest) without a confirmed person anchor
+            # These generate too many false positives from background objects
+            if 'no' in item_class:
+                continue
+            
+            # Only rescue positive detections (helmet, vest) with high confidence
+            if item['conf'] < 0.65:
+                continue
+            
+            ix1, iy1, ix2, iy2 = item['bbox']
+            iw, ih = ix2 - ix1, iy2 - iy1
+            if iw < 20 or ih < 20:
+                continue
+            
+            virtual_pb = [
+                ix1 - iw * 0.2, 
+                iy1 - (ih * 1.5 if 'helmet' in item_class else ih * 0.5), 
+                ix2 + iw * 0.2, 
+                iy2 + (ih * 1.5 if 'vest' in item_class else ih * 0.5)
+            ]
+            v_type = item_class.replace(' ', '') + '_ok'
+            violations.append(self._create_violation_entry(frame, virtual_pb, v_type, item['conf'], is_proxy=True))
+
+        # --- Temporal Cache: prevent flickering ---
+        if violations:
+            # Got real detections - update cache and reset age
+            self._det_cache = violations
+            self._det_age = 0
+        elif self._det_age < self.CACHE_TTL:
+            # No detections this frame, but cache is still fresh - use it
+            self._det_age += 1
+            return self._det_cache
+        else:
+            # Cache expired - truly no detections
+            self._det_cache = []
+            self._det_age = 0
 
         return violations
+
+    def _iou(self, box1, box2):
+        """Calculate Intersection over Union between two bboxes [x1,y1,x2,y2]"""
+        x1 = max(box1[0], box2[0])
+        y1 = max(box1[1], box2[1])
+        x2 = min(box1[2], box2[2])
+        y2 = min(box1[3], box2[3])
+        inter = max(0, x2 - x1) * max(0, y2 - y1)
+        if inter == 0:
+            return 0.0
+        area1 = (box1[2]-box1[0]) * (box1[3]-box1[1])
+        area2 = (box2[2]-box2[0]) * (box2[3]-box2[1])
+        return inter / (area1 + area2 - inter)
 
     def _is_inside(self, apd_bbox, person_bbox, type='head'):
         """Check if an APD bbox is reasonably within a person area"""
@@ -272,27 +448,26 @@ class ViolationsDetector:
 
     def _create_violation_entry(self, frame, bbox, v_type, conf, is_proxy=False):
         """Helper to create a standard violation entry with face recognition"""
-        # If it's a proxy from a person detection, we create a specialized bbox for better UI
         if is_proxy:
             px1, py1, px2, py2 = bbox
             p_w = px2 - px1
             p_h = py2 - py1
             
             if v_type in ['nohelmet', 'helmet_ok']:
-                # Head Area Scaling
+                # Head Area Scaling (Kotak tepat di area kepala)
                 scaled_bbox = [
-                    int(px1), 
-                    int(py1 - p_h * 0.08),
-                    int(px2), 
-                    int(py1 + p_h * 0.22)
+                    int(px1 + p_w * 0.15), 
+                    int(py1 - p_h * 0.05),
+                    int(px2 - p_w * 0.15), 
+                    int(py1 + p_h * 0.25)
                 ]
             elif v_type in ['novest', 'vest_ok']:
-                # Torso Area Scaling
+                # Torso Area Scaling (Kotak tepat di area bahu ke perut)
                 scaled_bbox = [
-                    int(px1), 
+                    int(px1 + p_w * 0.10), 
                     int(py1 + p_h * 0.25),
-                    int(px2), 
-                    int(py1 + p_h * 0.75)
+                    int(px2 - p_w * 0.10), 
+                    int(py1 + p_h * 0.70)
                 ]
             else:
                 scaled_bbox = bbox
@@ -303,114 +478,67 @@ class ViolationsDetector:
         worker_id = "Unknown"
         face_sim = 0.0
         
-        # Face recognition logic
+        # --- PERBAIKAN LOGIKA TRACKING IDENTITAS ---
         current_time = datetime.now().timestamp()
-        cx = (bbox[0] + bbox[2]) / 2
-        cy = (bbox[1] + bbox[3]) / 2
-        # Tighter grid for identity cooldown (5px instead of 20px) to distinguish close persons
-        loc_key = f"cam_{int(cx/5)}_{int(cy/5)}"
         
-        # Identity smoothing logic: Check if we have a recent valid identification for this location
-        cached = self.identity_cache.get(loc_key)
-        if cached and (current_time - cached['time'] < 4.0):
-            # Use cached identity to avoid flickering
-            worker_id = cached['id']
-            face_sim = cached['sim']
-        
-        # If no cache or cache expired (or we want to re-verify every 1.5s for faster response)
-        if self.use_face_recognition and (current_time - self.recognition_cooldowns.get(loc_key, 0) > 1.5):
-            self.recognition_cooldowns[loc_key] = current_time
+        # Cari di cache menggunakan Intersection over Union (IoU) dari kotak person, bukan grid kaku.
+        matched_cache_key = None
+        for k, v in list(self.identity_cache.items()):
+            # Hapus cache lama (> 4 detik)
+            if current_time - v['time'] > 4.0:
+                del self.identity_cache[k]
+                continue
             
-            # Specialized Face Crop Area: Top 40% of person, centered
+            # Cek overlap
+            if 'person_bbox' in v and self._iou(bbox, v['person_bbox']) > 0.4:
+                matched_cache_key = k
+                break
+                
+        if matched_cache_key:
+            worker_id = self.identity_cache[matched_cache_key]['id']
+            face_sim = self.identity_cache[matched_cache_key]['sim']
+            # Update person bbox as they move
+            self.identity_cache[matched_cache_key]['person_bbox'] = bbox
+        
+        # Panggil Face Recognition tiap 1.5 detik per orang untuk update
+        if self.use_face_recognition and (not matched_cache_key or current_time - self.identity_cache[matched_cache_key].get('last_scan', 0) > 1.5):
+            
+            # Kotak pencarian muka: Selalu gunakan area kepala dari bbox person
             if is_proxy:
                 px1, py1, px2, py2 = bbox
-                h = py2 - py1
-                w = px2 - px1
-                # Focus on a square-ish head area for better FaceNet performance
+                h = py2 - py1; w = px2 - px1
                 recon_bbox = [
-                    int(px1 + w * 0.15), 
-                    int(py1 - h * 0.02), 
-                    int(px2 - w * 0.15), 
+                    int(px1), 
+                    int(max(0, py1 - h * 0.05)), 
+                    int(px2), 
                     int(py1 + h * 0.35)
                 ]
             else:
                 recon_bbox = scaled_bbox
                 
-            recognized, face_sim = self.face_recognizer.recognize_face(frame, recon_bbox)
+            # FaceRecognitionSystem kita sekarang sudah stabil (sudah punya tracking internal)
+            recognized, new_sim = self.face_recognizer.recognize_face(frame, recon_bbox)
             
-            # --- VOTING SYSTEM ---
-            if loc_key not in self.identity_votes: self.identity_votes[loc_key] = []
-            current_vote = recognized if recognized else "Unknown"
-            self.identity_votes[loc_key].append(current_vote)
-            if len(self.identity_votes[loc_key]) > 8: self.identity_votes[loc_key].pop(0)
-            
-            # Count majority vote
-            from collections import Counter
-            vote_counts = Counter(self.identity_votes[loc_key])
-            winner, count = vote_counts.most_common(1)[0]
-            
-            # Only switch ID if it has significant majority (at least 3 consistent votes)
-            final_id = winner if (count >= 3 and winner != "Unknown") else (recognized if recognized else "Unknown")
-            
-            if final_id != "Unknown":
-                metadata = self.face_recognizer.face_metadata.get(final_id, {})
-                worker_id = metadata.get('name', final_id)
-                face_sim = float(face_sim)
+            if recognized:
+                metadata = self.face_recognizer.face_metadata.get(recognized, {})
+                worker_id = metadata.get('name', recognized)
+                face_sim = float(new_sim)
                 
-                # Update Cache for stability
-                self.identity_cache[loc_key] = {
+                # Simpan/update ke cache
+                if not matched_cache_key:
+                    import uuid
+                    matched_cache_key = str(uuid.uuid4())
+                    
+                self.identity_cache[matched_cache_key] = {
                     'id': worker_id,
                     'sim': face_sim,
-                    'time': current_time
+                    'time': current_time,
+                    'last_scan': current_time,
+                    'person_bbox': bbox
                 }
-            else:
-                # --- LOGIKA CAPTURE MUKA UNTUK UNKNOWN ---
-                try:
-                    # Ambil encoding muka ini
-                    current_encoding = self.face_recognizer.extract_face_features(frame, recon_bbox)
-                    if current_encoding is not None:
-                        # Cari di memory unknown yang mirip
-                        matched_temp_id = None
-                        from sklearn.metrics.pairwise import cosine_similarity
-                        
-                        now = datetime.now().timestamp()
-                        for tid, data in list(self.unknown_face_memory.items()):
-                            if now - data['last_seen'] > 600: # 10 menit
-                                del self.unknown_face_memory[tid]
-                                continue
-                            
-                            sim_unknown = cosine_similarity([current_encoding], [data['encoding']])[0][0]
-                            if sim_unknown > 0.85: # Threshold ketat untuk unknown grouping
-                                matched_temp_id = tid
-                                break
-                        
-                        if not matched_temp_id:
-                            # Buat temp ID baru
-                            import secrets
-                            matched_temp_id = f"Unknown_{secrets.token_hex(4)}"
-                            self.unknown_face_memory[matched_temp_id] = {
-                                'encoding': current_encoding,
-                                'last_seen': now
-                            }
-                        else:
-                            self.unknown_face_memory[matched_temp_id]['last_seen'] = now
-                        
-                        worker_id = matched_temp_id # Gunakan Temp ID sebagai worker_id
-                        
-                        # Save image to capture folder
-                        temp_id_dir = os.path.join(self.captures_path, matched_temp_id)
-                        os.makedirs(temp_id_dir, exist_ok=True)
-                        
-                        # Count existing images to avoid too many
-                        if len(os.listdir(temp_id_dir)) < 10:
-                            img_filename = f"face_{datetime.now().strftime('%H%M%S_%f')}.jpg"
-                            rx1, ry1, rx2, ry2 = map(int, recon_bbox)
-                            fh, fw = frame.shape[:2]
-                            face_crop = frame[max(0, ry1):min(fh, ry2), max(0, rx1):min(fw, rx2)]
-                            if face_crop.size > 0:
-                                cv2.imwrite(os.path.join(temp_id_dir, img_filename), face_crop)
-                except Exception as e:
-                    print(f"⚠️ Error in unknown capture logic: {e}")
+            elif matched_cache_key:
+                # Update waktu scan supaya tidak terus-terusan di scan tiap frame
+                self.identity_cache[matched_cache_key]['last_scan'] = current_time
 
         is_violation = v_type in ['nohelmet', 'novest']
         return {
@@ -418,7 +546,7 @@ class ViolationsDetector:
             'class': v_type,
             'confidence': float(conf),
             'worker_id': worker_id,
-            'is_violation': is_violation, # Flag untuk Dashboard
+            'is_violation': is_violation,
             'violation_severity': 'high' if is_violation else 'none',
             'violation_info': {
                 'is_violation': is_violation,
@@ -505,43 +633,37 @@ class ViolationsDetector:
         """
         for detection in detections:
             bbox = detection['bbox']
-            x1, y1, x2, y2 = bbox
+            x1, y1, x2, y2 = map(int, bbox)
             class_name = detection['class']
             confidence = detection['confidence']
-            
-            # --- RULE 4: Filter out SAFE statuses from Dashboard visualization ---
-            # But we still keep them in the detection list for backend stabilizer logic
-            if not detection.get('is_violation', True):
+
+            # Format worker ID label
+            raw_id = detection.get('worker_id', 'Unknown')
+            if raw_id and raw_id != 'Unknown' and not raw_id.startswith('Unknown_') and '#' not in raw_id:
+                id_label = raw_id
+            else:
+                id_label = '?'
+
+            is_violation = class_name in ('nohelmet', 'novest')
+
+            # Only draw VIOLATIONS — compliant workers show nothing (system is silent = safe)
+            if not is_violation:
                 continue
 
-            # Color based on violation type
-            worker_id = detection.get('worker_id', 'Unknown')
-            if class_name == 'nohelmet':
-                color = (0, 0, 255)  # Red for no helmet violation
-                label = f"No Helmet {confidence:.2f} [{worker_id}]"
-            elif class_name == 'novest':
-                color = (0, 165, 255)  # Orange for no vest violation
-                label = f"No Vest {confidence:.2f} [{worker_id}]"
-            elif class_name == 'helmet_ok':
-                color = (0, 255, 0)  # Green for SAFE
-                label = f"Helmet OK [{worker_id}]"
-            elif class_name == 'vest_ok':
-                color = (0, 255, 0)  # Green for SAFE
-                label = f"Vest OK [{worker_id}]"
+            # --- VIOLATION: Red/Orange, thick border, prominent label ---
+            color = (0, 0, 255) if class_name == 'nohelmet' else (0, 140, 255)
+            label = 'No Helm' if class_name == 'nohelmet' else 'No Vest'
+            label += f" {confidence:.2f}"
+            if id_label != '?':
+                label += f" [{id_label}]"
             else:
-                continue  # Skip unknown classes
-            
-            # Draw bounding box
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            
-            # Draw label background - optimized
-            label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 2)[0]  # Reduced font size
-            cv2.rectangle(frame, (x1, y1 - label_size[1] - 8), 
-                         (x1 + label_size[0], y1), color, -1)
-            
-            # Draw label text
-            cv2.putText(frame, label, (x1, y1 - 4), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)  # Thinner text
+                label += " [Unknown]"
+
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+            lw, lh = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+            cv2.rectangle(frame, (x1, y1 - lh - 10), (x1 + lw + 6, y1), color, -1)
+            cv2.putText(frame, label, (x1 + 3, y1 - 4),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         
         return frame
     

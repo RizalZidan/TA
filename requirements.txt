@@ -45,3 +45,6 @@ torch>=2.0.0
 torchvision>=0.15.0
 onnx>=1.14.0
 onnxruntime>=1.15.0
+
+# Official FaceNet (512D)
+facenet-pytorch>=2.5.3

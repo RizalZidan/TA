@@ -108,6 +108,13 @@ def init_db():
         VALUES (?, ?, ?)
     ''', ('admin', admin_password, 'admin'))
     
+    # Create default petugas user
+    petugas_password = hashlib.sha256('petugas123'.encode()).hexdigest()
+    cursor.execute('''
+        INSERT OR IGNORE INTO users (username, password, role) 
+        VALUES (?, ?, ?)
+    ''', ('petugas', petugas_password, 'petugas'))
+    
     conn.commit()
     conn.close()
 
@@ -132,7 +139,7 @@ init_db()
 
 # Use the high-accuracy PREMIER 50-Epoch model (86.03%)
 # Now safe to use because coordinate shifting has been fixed.
-detector = ViolationsDetector(confidence_threshold=0.30)
+detector = ViolationsDetector(confidence_threshold=0.40)
 
 # Migration: Sync workers from pickle to SQLite if needed
 def sync_workers_to_db():
@@ -617,17 +624,36 @@ def start_camera_monitoring(camera_id, camera_source):
         # Regular webcam/file connection
         source = int(camera_source) if camera_source.isdigit() else camera_source
         
-        # On Windows, the default MSMF backend sometimes claims isOpened()=True but cannot read frames.
-        # So we prioritize DirectShow (CAP_DSHOW) for physical webcams.
+        # On Windows, open webcam with silent multi-backend fallback.
+        # CAP_ANY lets OpenCV choose the best available backend automatically.
         if isinstance(source, int) and os.name == 'nt':
-            print(f"📡 Using DSHOW backend for webcam {source} on Windows...")
-            cap = cv2.VideoCapture(source, cv2.CAP_DSHOW)
+            backends = [
+                (cv2.CAP_ANY,  "Auto"),
+                (cv2.CAP_MSMF, "MSMF"),
+                (-1,           "Default"),   # -1 = no backend hint
+            ]
+            cap = None
+            used_backend = "None"
+            for backend_id, backend_name in backends:
+                try:
+                    if backend_id == -1:
+                        _cap = cv2.VideoCapture(source)
+                    else:
+                        _cap = cv2.VideoCapture(source, backend_id)
+                    ret, _ = _cap.read()
+                    if ret and _cap.isOpened():
+                        cap = _cap
+                        used_backend = backend_name
+                        break
+                    else:
+                        _cap.release()
+                except Exception:
+                    pass
             
-            # Test if we can actually read a frame
-            ret, _ = cap.read()
-            if not ret:
-                print(f"⚠️ DSHOW failed to read frame, falling back to default backend...")
-                cap = cv2.VideoCapture(source)
+            if cap is None:
+                print(f"❌ All webcam backends failed for source {source}")
+                return False
+            print(f"✅ Webcam {source} opened via {used_backend} backend")
         else:
             cap = cv2.VideoCapture(source)
         if not cap.isOpened():
@@ -746,7 +772,8 @@ def monitor_camera(camera_id, cap):
         # Only run AI every 5 frames to keep the feed smooth (Optimized from 3)
         if frame_count % 5 == 0:
             try:
-                detections = detector.detect_violations(frame)
+                is_cctv = str(camera_id) != '0'
+                detections = detector.detect_violations(frame, enable_face_anchor=(not is_cctv))
             except Exception as e:
                 import traceback
                 with open('error_log.txt', 'a') as f:
@@ -1243,7 +1270,7 @@ DASHBOARD_TEMPLATE = """
 
         .sidebar-brand h1 {
             font-family: 'Outfit', sans-serif;
-            font-size: 20px;
+            font-size: 22px;
             font-weight: 800;
             letter-spacing: -0.5px;
             background: linear-gradient(135deg, #fff 0%, #a5b4fc 100%);
@@ -1267,7 +1294,7 @@ DASHBOARD_TEMPLATE = """
             color: var(--text-slate-400);
             text-decoration: none;
             font-weight: 600;
-            font-size: 14px;
+            font-size: 15px;
             cursor: pointer;
             transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
             gap: 12px;
@@ -1281,13 +1308,25 @@ DASHBOARD_TEMPLATE = """
         .nav-item.active {
             background: rgba(99, 102, 241, 0.1);
             color: var(--primary);
-            box-shadow: inset 0 0 0 1px rgba(99, 102, 241, 0.2);
+            box-shadow: inset 0 0 0 1px rgba(99, 102, 241, 0.1);
         }
 
-        .nav-item .icon {
-            font-size: 18px;
-            width: 24px;
-            text-align: center;
+        .nav-label {
+            font-size: 10px;
+            font-weight: 800;
+            color: var(--text-slate-400);
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            margin: 24px 16px 8px;
+            opacity: 0.5;
+        }
+
+        .nav-menu {
+            padding: 16px;
+            flex-grow: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
         }
 
         /* Main Content Styling */
@@ -1314,8 +1353,8 @@ DASHBOARD_TEMPLATE = """
         }
 
         .header-title {
-            font-size: 14px;
-            font-weight: 600;
+            font-size: 16px;
+            font-weight: 700;
             color: var(--text-slate-400);
             text-transform: uppercase;
             letter-spacing: 1px;
@@ -1383,7 +1422,7 @@ DASHBOARD_TEMPLATE = """
         }
 
         .card-title {
-            font-size: 16px;
+            font-size: 18px;
             font-weight: 700;
             color: #fff;
             display: flex;
@@ -1493,7 +1532,7 @@ DASHBOARD_TEMPLATE = """
 
         .stat-label {
             color: var(--text-slate-400);
-            font-size: 12px;
+            font-size: 14px;
             font-weight: 700;
             text-transform: uppercase;
             letter-spacing: 1px;
@@ -1502,7 +1541,7 @@ DASHBOARD_TEMPLATE = """
 
         .stat-value {
             font-family: 'Outfit', sans-serif;
-            font-size: 32px;
+            font-size: 38px;
             font-weight: 800;
             color: var(--text-slate-50);
         }
@@ -1524,7 +1563,7 @@ DASHBOARD_TEMPLATE = """
         th {
             background: rgba(255, 255, 255, 0.02);
             padding: 16px 24px;
-            font-size: 12px;
+            font-size: 13px;
             font-weight: 700;
             color: var(--text-slate-400);
             text-transform: uppercase;
@@ -1534,7 +1573,7 @@ DASHBOARD_TEMPLATE = """
 
         td {
             padding: 16px 24px;
-            font-size: 13px;
+            font-size: 14px;
             color: var(--text-slate-300);
             border-bottom: 1px solid var(--border-slate-700);
         }
@@ -1734,41 +1773,50 @@ DASHBOARD_TEMPLATE = """
             transform: rotate(180deg);
         }
 
-        /* Modern Light Mode */
+        /* Modern Light Mode - Full Refinement */
         body.light-mode {
             --bg-slate-950: #f8fafc;
             --bg-slate-900: #ffffff;
             --bg-slate-800: #f1f5f9;
             --text-slate-50: #0f172a;
             --text-slate-400: #64748b;
-            --text-slate-300: #1e293b;
+            --text-slate-300: #334155;
             --border-slate-700: #e2e8f0;
             --glass-bg: rgba(255, 255, 255, 0.8);
         }
-        body.light-mode .sidebar { background: #fff; }
-        body.light-mode .nav-item:hover { background: #f1f5f9; }
-        body.light-mode .card, body.light-mode .stat-card { box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        body.light-mode .sidebar { background: #fff; border-right-color: #e2e8f0; }
         body.light-mode .sidebar-brand h1 { background: var(--primary); -webkit-background-clip: text; }
-        body.light-mode input, body.light-mode select { color: var(--text-slate-50); }
-        body.light-mode .stat-value, body.light-mode .percentage { color: var(--text-slate-50); }
-
-        /* Custom Header Button */
-        .add-camera-btn {
-            background: #000;
-            color: #fff;
-            padding: 8px 16px;
-            border: 2px solid #fff;
-            font-family: 'Courier New', monospace;
-            font-weight: 700;
-            cursor: pointer;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            transition: all 0.3s ease;
+        body.light-mode .nav-item { color: #64748b; }
+        body.light-mode .nav-item:hover { background: #f1f5f9; color: var(--primary); }
+        body.light-mode .nav-item.active { background: rgba(99, 102, 241, 0.08); color: var(--primary); }
+        body.light-mode .header { background: rgba(255, 255, 255, 0.8); border-bottom-color: #e2e8f0; }
+        body.light-mode .card, body.light-mode .stat-card { 
+            background: #fff; 
+            border-color: #e2e8f0; 
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03); 
         }
-        .add-camera-btn:hover {
-            background: #fff;
-            color: #000;
+        body.light-mode .card-title, body.light-mode h3 { color: #0f172a; }
+        body.light-mode .stat-value { color: #0f172a; }
+        body.light-mode td { color: #334155; border-bottom-color: #f1f5f9; }
+        body.light-mode th { background: #f8fafc; color: #64748b; border-bottom-color: #e2e8f0; }
+        body.light-mode input, body.light-mode select { 
+            background: #fff; 
+            border-color: #cbd5e1; 
+            color: #0f172a; 
         }
+        body.light-mode .btn-action:not(.btn-primary) { 
+            background: #fff; 
+            border-color: #e2e8f0; 
+            color: #475569; 
+        }
+        body.light-mode .btn-action:not(.btn-primary):hover { background: #f8fafc; border-color: #cbd5e1; }
+        body.light-mode .modal-content { background: #fff; border-color: #e2e8f0; color: #0f172a; }
+        body.light-mode .modal-title { color: #0f172a; }
+        body.light-mode .circle-bg { stroke: #f1f5f9; }
+        body.light-mode .percentage { color: #0f172a; }
+        body.light-mode #face-guide-box { border-color: var(--primary); }
+        body.light-mode .submenu-item:hover { background: #f1f5f9; color: var(--primary); }
+        body.light-mode .submenu-item.active { color: var(--primary); }
     </style>
 </head>
 <body>
@@ -1779,15 +1827,37 @@ DASHBOARD_TEMPLATE = """
                 <h1>NYAWANG</h1>
             </div>
             <nav class="nav-menu">
-                <a class="nav-item active" onclick="showTab('cameras')" id="nav-cameras">
-                    <span class="icon">📹</span> Kamera
-                </a>
-                <a class="nav-item" onclick="showTab('statistics')" id="nav-statistics">
-                    <span class="icon">📊</span> Statistik
-                </a>
+                <div class="nav-label">Monitoring</div>
+                <div class="nav-group">
+                    <a class="nav-item active" onclick="toggleSubmenu('cameras'); showTab('cameras')" id="nav-cameras">
+                        <span class="icon">📹</span> Kamera <span class="arrow">▼</span>
+                    </a>
+                    <div id="submenu-cameras" class="submenu active">
+                        <a class="submenu-item" onclick="changeViewModeSidebar('1', this)">1 Kamera</a>
+                        <a class="submenu-item" onclick="changeViewModeSidebar('2', this)">2 Kamera</a>
+                        <a class="submenu-item active" onclick="changeViewModeSidebar('4', this)">4 Kamera</a>
+                        <a class="submenu-item" onclick="changeViewModeSidebar('8', this)">8 Kamera</a>
+                        <a class="submenu-item" onclick="changeViewModeSidebar('16', this)">16 Kamera</a>
+                        <a class="submenu-item" onclick="changeViewModeSidebar('all', this)">Semua Kamera</a>
+                        {% if session.role == 'admin' %}
+                        <div style="border-top: 1px solid var(--border-slate-700); margin-top: 8px; padding-top: 8px;">
+                            <a class="submenu-item" onclick="openAddCameraModal()" style="color: var(--primary); font-weight: 700;">+ Tambah Kamera</a>
+                        </div>
+                        {% endif %}
+                    </div>
+                </div>
+                
                 <a class="nav-item" onclick="showTab('violations')" id="nav-violations">
                     <span class="icon">🚨</span> Pelanggaran
                 </a>
+
+                {% if session.role == 'admin' %}
+                <div class="nav-label">Analisis</div>
+                <a class="nav-item" onclick="showTab('statistics')" id="nav-statistics">
+                    <span class="icon">📊</span> Statistik
+                </a>
+
+                <div class="nav-label">Management</div>
                 <div class="nav-group">
                     <a class="nav-item" onclick="toggleSubmenu('workers')" id="nav-workers">
                         <span class="icon">👥</span> Pekerja <span class="arrow">▼</span>
@@ -1798,16 +1868,20 @@ DASHBOARD_TEMPLATE = """
                         <a class="submenu-item" onclick="switchToWorkerSection('captures')" id="sub-captures">Dataset Capture</a>
                     </div>
                 </div>
+                <a class="nav-item" onclick="showTab('users')" id="nav-users">
+                    <span class="icon">👤</span> Manajemen User
+                </a>
                 <a class="nav-item" onclick="showTab('settings')" id="nav-settings">
                     <span class="icon">⚙️</span> Pengaturan
                 </a>
+                {% endif %}
             </nav>
             <div style="padding: 24px; border-top: 1px solid var(--border-slate-700);">
                 <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 16px;">
                     <div style="width: 32px; height: 32px; background: var(--primary); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 12px;">AD</div>
                     <div style="overflow: hidden;">
                         <p style="font-size: 13px; font-weight: 700; color: #fff; white-space: nowrap; text-overflow: ellipsis;">{{ session.username }}</p>
-                        <p style="font-size: 11px; color: var(--text-slate-400);">Administrator</p>
+                        <p style="font-size: 11px; color: var(--text-slate-400);">{{ 'Administrator' if session.role == 'admin' else 'Petugas Lapangan' }}</p>
                     </div>
                 </div>
                 <a href="/logout" class="btn-action" style="justify-content: center; color: #f87171; border-color: rgba(239, 68, 68, 0.1); background: rgba(239, 68, 68, 0.05); width: 100%;">
@@ -1826,27 +1900,14 @@ DASHBOARD_TEMPLATE = """
                     <button class="btn-action" onclick="toggleLightMode()" id="theme-btn">
                         <span>💡</span> Mode Terang
                     </button>
-                    <button class="btn-action btn-primary" onclick="openAddCameraModal()" id="main-add-btn">
-                        <span>+</span> Tambah Kamera
-                    </button>
                 </div>
             </header>
 
             <div class="content-body">
                 <!-- Cameras Tab -->
                 <div id="cameras" class="tab-content active">
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;">
-                        <h3 style="font-size: 20px; font-family: 'Outfit'; font-weight: 800;">Overview Kamera</h3>
-                        <div class="form-group" style="margin-bottom: 0;">
-                            <select id="view-mode" onchange="changeViewMode()" style="padding: 8px 16px; min-width: 140px;">
-                                <option value="1">1 Kamera</option>
-                                <option value="2">2 Kamera</option>
-                                <option value="4" selected>4 Kamera</option>
-                                <option value="8">8 Kamera</option>
-                                <option value="16">16 Kamera</option>
-                                <option value="all">Semua Kamera</option>
-                            </select>
-                        </div>
+                    <div style="margin-bottom: 24px;">
+                        <!-- Filter atau Label tambahan jika perlu di sini -->
                     </div>
                     <div class="camera-grid" id="camera-grid">
                         <!-- Camera cards loaded via JS -->
@@ -1855,16 +1916,22 @@ DASHBOARD_TEMPLATE = """
 
                 <!-- Statistics Tab -->
                 <div id="statistics" class="tab-content">
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;">
-                        <h3 style="font-size: 20px; font-family: 'Outfit'; font-weight: 800;">Analisis Statistik</h3>
+                    <div style="background: var(--bg-slate-900); border: 1px solid var(--border-slate-700); border-radius: 12px; padding: 12px 20px; margin-bottom: 24px; display: flex; justify-content: space-between; align-items: center;">
+                        <!-- Left: Date Filter -->
                         <div style="display: flex; gap: 12px; align-items: center;">
-                            <input type="date" id="start-date" onchange="updateDailyStats()" class="btn-action" style="padding: 8px;">
-                            <input type="date" id="end-date" onchange="updateDailyStats()" class="btn-action" style="padding: 8px;">
-                            <button class="btn-action" onclick="resetData()" style="color: #f87171; border-color: rgba(239,68,68,0.2); font-weight: 700; background: rgba(239,68,68,0.05);">Reset Data</button>
+                            <span style="font-size: 13px; font-weight: 700; color: var(--text-slate-400); text-transform: uppercase; letter-spacing: 0.5px;">📅 Periode Laporan:</span>
+                            <input type="date" id="start-date" onchange="refreshStatistics()" class="btn-action" style="padding: 6px 12px; font-size: 13px;">
+                            <span style="color: var(--text-slate-400); font-size: 12px;">s/d</span>
+                            <input type="date" id="end-date" onchange="refreshStatistics()" class="btn-action" style="padding: 6px 12px; font-size: 13px;">
                         </div>
+                        
+                        <!-- Right: Danger Action -->
+                        <button class="btn-action" onclick="resetData()" style="color: #f87171; border-color: rgba(239,68,68,0.2); font-weight: 700; background: rgba(239,68,68,0.05); padding: 8px 16px; font-size: 13px;">
+                            <span>🗑️</span> Reset Data
+                        </button>
                     </div>
 
-                    <div class="stats-grid">
+                    <div class="stats-grid" style="grid-template-columns: repeat(3, 1fr); margin-bottom: 24px;">
                         <div class="stat-card">
                             <p class="stat-label">Total Pelanggaran</p>
                             <p class="stat-value" id="total-violations">0</p>
@@ -1876,10 +1943,6 @@ DASHBOARD_TEMPLATE = """
                         <div class="stat-card">
                             <p class="stat-label">Tanpa Rompi</p>
                             <p class="stat-value" id="no-vest-count" style="color: #fbbf24;">0</p>
-                        </div>
-                        <div class="stat-card">
-                            <p class="stat-label">Status Sistem</p>
-                            <p class="stat-value" id="active-cameras" style="color: #10b981; font-size: 18px; margin-top: 12px;">Online</p>
                         </div>
                     </div>
 
@@ -1937,20 +2000,27 @@ DASHBOARD_TEMPLATE = """
 
                 <!-- Violations Tab -->
                 <div id="violations" class="tab-content">
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;">
-                        <h3 style="font-size: 20px; font-family: 'Outfit'; font-weight: 800;">Log Pelanggaran</h3>
-                        <div style="display: flex; gap: 12px;">
-                            <button class="btn-action" onclick="exportData('pdf')">PDF</button>
-                            <button class="btn-action" onclick="exportData('excel')">Excel</button>
-                        </div>
-                    </div>
-
-                    <div class="card" style="padding: 0;">
-                        <div style="padding: 20px; border-bottom: 1px solid var(--border-slate-700); display: flex; gap: 16px; align-items: center;">
-                            <span style="font-size: 13px; color: var(--text-slate-400);">Filter Tanggal:</span>
-                            <input type="date" id="violation-start-date" onchange="loadViolations()" class="btn-action" style="padding: 6px;">
-                            <span style="color: var(--text-slate-700);">→</span>
-                            <input type="date" id="violation-end-date" onchange="loadViolations()" class="btn-action" style="padding: 6px;">
+                    <div class="card" style="padding: 0; overflow: hidden; border: 1px solid var(--border-slate-700);">
+                        <div style="padding: 16px 24px; border-bottom: 1px solid var(--border-slate-700); display: flex; justify-content: space-between; align-items: center; background: rgba(255,255,255,0.01);">
+                            <!-- Left: Date Filter -->
+                            <div style="display: flex; gap: 12px; align-items: center;">
+                                <div style="display: flex; align-items: center; gap: 8px; color: var(--text-slate-400); font-size: 14px; font-weight: 600;">
+                                    <span>📅</span> Filter Tanggal:
+                                </div>
+                                <input type="date" id="violation-start-date" onchange="loadViolations()" class="btn-action" style="padding: 6px 12px; font-size: 13px;">
+                                <span style="color: var(--text-slate-400); font-size: 12px;">sampai</span>
+                                <input type="date" id="violation-end-date" onchange="loadViolations()" class="btn-action" style="padding: 6px 12px; font-size: 13px;">
+                            </div>
+                            
+                            <!-- Right: Export Actions -->
+                            <div style="display: flex; gap: 10px;">
+                                <button class="btn-action" onclick="exportData('pdf')" style="padding: 8px 16px; font-size: 13px; font-weight: 700; border-color: rgba(239, 68, 68, 0.2); color: #f87171;">
+                                    <span>📄</span> PDF
+                                </button>
+                                <button class="btn-action" onclick="exportData('excel')" style="padding: 8px 16px; font-size: 13px; font-weight: 700; border-color: rgba(16, 185, 129, 0.2); color: #10b981;">
+                                    <span>📊</span> Excel
+                                </button>
+                            </div>
                         </div>
                         <div class="table-container" style="border: none; border-radius: 0;">
                             <table>
@@ -1974,7 +2044,6 @@ DASHBOARD_TEMPLATE = """
 
                 <!-- Workers Tab -->
                 <div id="workers" class="tab-content">
-                    <h3 style="font-size: 20px; font-family: 'Outfit'; font-weight: 800; margin-bottom: 24px;">Manajemen Pekerja</h3>
                     
                     <div id="worker-list-section" class="sub-section active">
                         <div class="table-container">
@@ -2035,26 +2104,61 @@ DASHBOARD_TEMPLATE = """
                     </div>
                 </div>
 
-                <!-- Settings Tab -->
-                <div id="settings" class="tab-content">
-                    <h3 style="font-size: 20px; font-family: 'Outfit'; font-weight: 800; margin-bottom: 24px;">Pengaturan Sistem</h3>
-                    <div class="card" style="max-width: 500px;">
-                        <div class="form-group">
-                            <label>Cooldown Deteksi (Detik)</label>
-                            <input type="number" id="cooldown-setting" value="5">
-                            <p style="font-size: 11px; color: var(--text-slate-400); margin-top: 4px;">Waktu jeda antar deteksi pelanggaran serupa.</p>
+                {% if session.role == 'admin' %}
+                <!-- Users Management Tab -->
+                <div id="users" class="tab-content">
+                    <div style="display: flex; justify-content: flex-end; align-items: center; margin-bottom: 24px;">
+                        <button class="btn-action btn-primary" onclick="openUserModal()">+ Tambah Akun</button>
+                    </div>
+                    
+                    <div class="card" style="padding: 0; overflow: hidden; border: 1px solid var(--border-slate-700);">
+                        <div class="table-container" style="border: none; border-radius: 0;">
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>Username</th>
+                                        <th>Role</th>
+                                        <th>Tanggal Dibuat</th>
+                                        <th>Aksi</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="users-tbody">
+                                    <!-- Loaded via JS -->
+                                </tbody>
+                            </table>
                         </div>
-                        <div class="form-group">
-                            <label>Treshold (Confidence)</label>
-                            <input type="range" id="confidence-setting" min="0.1" max="1.0" step="0.05" value="0.3" style="accent-color: var(--primary);">
-                            <div style="display: flex; justify-content: space-between; font-size: 11px; color: var(--text-slate-400);">
-                                <span>0.1 (Sensitif)</span>
-                                <span>1.0 (Ketat)</span>
-                            </div>
-                        </div>
-                        <button class="btn-action btn-primary" onclick="saveSettings()" style="width: 100%; justify-content: center; padding: 12px;">Simpan Perubahan</button>
                     </div>
                 </div>
+
+                <div id="settings" class="tab-content">
+                    <div class="card" style="max-width: 450px; background: var(--bg-slate-900); border: 1px solid var(--border-slate-700);">
+                        <div class="form-group" style="margin-bottom: 24px;">
+                            <label style="font-weight: 600; color: var(--text-slate-300);">Cooldown Deteksi</label>
+                            <div style="display: flex; align-items: center; gap: 10px; margin-top: 8px;">
+                                <input type="number" id="cooldown-setting" value="5" style="width: 80px; padding: 8px;">
+                                <span style="font-size: 14px; color: var(--text-slate-400);">detik</span>
+                            </div>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label style="font-weight: 600; color: var(--text-slate-300); display: block; margin-bottom: 12px;">
+                                Treshold Confidence: <span id="confidence-value" style="color: var(--primary);">0.40</span>
+                            </label>
+                            <input type="range" id="confidence-setting" min="0.40" max="0.90" step="0.01" value="0.40" 
+                                   style="width: 100%; cursor: pointer;"
+                                   oninput="document.getElementById('confidence-value').textContent = parseFloat(this.value).toFixed(2)">
+                            <div style="display: flex; justify-content: space-between; font-size: 11px; color: var(--text-slate-400); margin-top: 8px;">
+                                <span>0.40</span>
+                                <span>0.90</span>
+                            </div>
+                        </div>
+                        
+                        <button class="btn-action btn-primary" onclick="saveSettings()" style="width: 100%; justify-content: center; padding: 10px; margin-top: 20px; border-radius: 8px; font-weight: 600;">
+                            Simpan Pengaturan
+                        </button>
+                    </div>
+                </div>
+                {% endif %}
             </div>
         </main>
     </div>
@@ -2149,6 +2253,34 @@ DASHBOARD_TEMPLATE = """
         </div>
     </div>
 
+    <!-- Add User Modal -->
+    <div id="user-modal" class="modal">
+        <div class="modal-content" style="max-width: 450px;">
+            <div class="modal-header">
+                <h3 style="font-family: 'Outfit'; font-weight: 800;">Tambah Akun Baru</h3>
+            </div>
+            <div class="form-group" style="margin-top: 20px;">
+                <label>Username</label>
+                <input type="text" id="new-user-username" placeholder="Masukkan username" required>
+            </div>
+            <div class="form-group">
+                <label>Password</label>
+                <input type="password" id="new-user-password" placeholder="Masukkan password" required>
+            </div>
+            <div class="form-group">
+                <label>Role</label>
+                <select id="new-user-role" style="width: 100%; padding: 12px; border-radius: 8px; background: var(--bg-slate-800); border: 1px solid var(--border-slate-700); color: #fff;">
+                    <option value="petugas">Petugas Lapangan</option>
+                    <option value="admin">Administrator</option>
+                </select>
+            </div>
+            <div style="display: flex; gap: 12px; margin-top: 32px;">
+                <button class="btn-action" style="flex: 1; justify-content: center;" onclick="closeUserModal()">Batal</button>
+                <button class="btn-action btn-primary" style="flex: 1; justify-content: center;" onclick="addUser()">Simpan User</button>
+            </div>
+        </div>
+    </div>
+
     <script>
         // Set tema awal sebelum halaman loading selesai agar tidak berkedip
         if(localStorage.getItem('theme') === 'light') {
@@ -2158,12 +2290,19 @@ DASHBOARD_TEMPLATE = """
         function toggleLightMode() {
             document.body.classList.toggle('light-mode');
             const btn = document.getElementById('theme-btn');
-            if(document.body.classList.contains('light-mode')) {
+            const isLight = document.body.classList.contains('light-mode');
+            
+            if(isLight) {
                 btn.innerHTML = '<span>🌙</span> Mode Gelap';
                 localStorage.setItem('theme', 'light');
             } else {
                 btn.innerHTML = '<span>💡</span> Mode Terang';
                 localStorage.setItem('theme', 'dark');
+            }
+            
+            // Re-draw chart to update colors if it exists
+            if (dailyChartInstance) {
+                updateDailyStats();
             }
         }
         
@@ -2178,10 +2317,26 @@ DASHBOARD_TEMPLATE = """
         let editingCameraId = null;
         let currentViewMode = 4;  // 1,2,4,8,16 cams
         
-        function changeViewMode() {
-            const val = document.getElementById('view-mode').value;
-            currentViewMode = (val === 'all') ? 'all' : parseInt(val, 10);
+        function changeViewModeSidebar(mode, element) {
+            // Update current global state
+            currentViewMode = (mode === 'all') ? 'all' : parseInt(mode, 10);
+            
+            // Update UI Sidebar Active state
+            const submenu = document.getElementById('submenu-cameras');
+            if (submenu) {
+                submenu.querySelectorAll('.submenu-item').forEach(item => item.classList.remove('active'));
+            }
+            if (element) element.classList.add('active');
+            
+            // Refresh cameras with new mode
             loadCameras();
+            localStorage.setItem('viewMode', mode);
+        }
+
+        function changeViewMode() {
+            // Keep for compatibility if needed elsewhere
+            const val = document.getElementById('view-mode')?.value || '4';
+            changeViewModeSidebar(val);
         }
 
         function showTab(tabName) {
@@ -2207,6 +2362,66 @@ DASHBOARD_TEMPLATE = """
             else if (tabName === 'statistics') loadStatistics();
             else if (tabName === 'violations') loadViolations();
             else if (tabName === 'workers') showWorkerSection('list');
+            else if (tabName === 'users') loadUsers();
+            else if (tabName === 'settings') loadCurrentSettings();
+        }
+
+        // --- User Management ---
+        function openUserModal() {
+            document.getElementById('user-modal').style.display = 'flex';
+        }
+        function closeUserModal() {
+            document.getElementById('user-modal').style.display = 'none';
+        }
+        function loadUsers() {
+            fetch('/api/users')
+                .then(r => r.json())
+                .then(users => {
+                    const tbody = document.getElementById('users-tbody');
+                    tbody.innerHTML = users.map(u => `
+                        <tr>
+                            <td style="font-weight: 700;">${u.username}</td>
+                            <td><span class="badge ${u.role === 'admin' ? 'badge-primary' : ''}" style="background: ${u.role === 'admin' ? 'rgba(99,102,241,0.2)' : 'rgba(100,116,139,0.2)'}; color: ${u.role === 'admin' ? '#a5b4fc' : '#94a3b8'};">${u.role.toUpperCase()}</span></td>
+                            <td style="color: var(--text-slate-400); font-size: 12px;">${u.created_at}</td>
+                            <td>
+                                ${u.username !== 'admin' ? `
+                                    <button class="btn-action" style="padding: 4px 8px; color: #f87171; border-color: rgba(239,68,68,0.1);" onclick="deleteUser('${u.username}')">Hapus</button>
+                                ` : '<span style="font-size: 11px; color: #555;">Sistem</span>'}
+                            </td>
+                        </tr>
+                    `).join('');
+                });
+        }
+        function addUser() {
+            const username = document.getElementById('new-user-username').value;
+            const password = document.getElementById('new-user-password').value;
+            const role = document.getElementById('new-user-role').value;
+            
+            if (!username || !password) return alert('Lengkapi data!');
+            
+            fetch('/api/users', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({username, password, role})
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    closeUserModal();
+                    loadUsers();
+                } else {
+                    alert('Gagal: ' + data.message);
+                }
+            });
+        }
+        function deleteUser(username) {
+            if (!confirm(`Hapus akun ${username}?`)) return;
+            fetch(`/api/users/${username}`, { method: 'DELETE' })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.success) loadUsers();
+                    else alert('Gagal: ' + data.message);
+                });
         }
         
         function toggleSubmenu(id) {
@@ -2423,14 +2638,21 @@ DASHBOARD_TEMPLATE = """
                 .catch(err => alert('Error mereset data.'));
         }
         
+        function refreshStatistics() {
+            loadStatistics();
+            updateDailyStats();
+        }
+
         function loadStatistics() {
-            fetch('/api/statistics')
+            const start = document.getElementById('start-date').value;
+            const end = document.getElementById('end-date').value;
+            
+            fetch(`/api/statistics?start=${start}&end=${end}`)
                 .then(r => r.json())
                 .then(data => {
                     document.getElementById('total-violations').textContent = data.total_violations;
                     document.getElementById('no-helmet-count').textContent = data.no_helmet_count;
                     document.getElementById('no-vest-count').textContent = data.no_vest_count;
-                    document.getElementById('active-cameras').textContent = data.active_cameras;
                     
                     const apdVal  = typeof data.avg_apd_accuracy  === 'number' ? data.avg_apd_accuracy  : 0;
                     const faceVal = typeof data.avg_face_accuracy  === 'number' ? data.avg_face_accuracy : 0;
@@ -2438,18 +2660,15 @@ DASHBOARD_TEMPLATE = """
                     document.getElementById('avg-apd-accuracy').textContent  = apdVal.toFixed(1)  + '%';
                     document.getElementById('avg-face-accuracy').textContent = faceVal.toFixed(1) + '%';
                     
-                    // Update Circular Progress (Circumference is exactly 100)
+                    // Update Circular Progress
                     const apdOffset = 100 - Math.min(apdVal, 100);
                     const faceOffset = 100 - Math.min(faceVal, 100);
                     
                     document.getElementById('apd-circle').style.strokeDashoffset = apdOffset;
                     document.getElementById('face-circle').style.strokeDashoffset = faceOffset;
                     
-                    // Update trend
                     const now = new Date();
                     document.getElementById('last-update').textContent = 'Terakhir Diupdate: ' + now.toLocaleTimeString();
-                    
-                    updateDailyStats();
                 });
         }
         
@@ -2493,6 +2712,10 @@ DASHBOARD_TEMPLATE = """
             greyGradient.addColorStop(0, 'rgba(136, 136, 136, 0.1)');
             greyGradient.addColorStop(1, 'rgba(136, 136, 136, 0)');
 
+            const isLight = document.body.classList.contains('light-mode');
+            const gridColor = isLight ? 'rgba(0, 0, 0, 0.05)' : 'rgba(255, 255, 255, 0.05)';
+            const textColor = isLight ? '#64748b' : '#94a3b8';
+
             dailyChartInstance = new Chart(ctx, {
                 type: 'line',
                 data: {
@@ -2504,28 +2727,28 @@ DASHBOARD_TEMPLATE = """
                         {
                             label: 'Tanpa Helm',
                             data: helmetCounts,
-                            borderColor: '#00e5ff',
+                            borderColor: '#6366f1',
                             backgroundColor: cyanGradient,
                             borderWidth: 3,
                             fill: true,
-                            tension: 0.4, // Smooth Bezier curves
+                            tension: 0.4,
                             pointRadius: 4,
-                            pointBackgroundColor: '#00e5ff',
-                            pointBorderColor: '#000',
+                            pointBackgroundColor: '#6366f1',
+                            pointBorderColor: isLight ? '#fff' : '#000',
                             pointBorderWidth: 2,
                             pointHoverRadius: 6
                         },
                         {
                             label: 'Tanpa Rompi',
                             data: vestCounts,
-                            borderColor: '#888',
+                            borderColor: isLight ? '#94a3b8' : '#888',
                             backgroundColor: greyGradient,
                             borderWidth: 3,
                             fill: true,
                             tension: 0.4,
                             pointRadius: 4,
-                            pointBackgroundColor: '#888',
-                            pointBorderColor: '#000',
+                            pointBackgroundColor: isLight ? '#94a3b8' : '#888',
+                            pointBorderColor: isLight ? '#fff' : '#000',
                             pointBorderWidth: 2,
                             pointHoverRadius: 6
                         }
@@ -2538,13 +2761,13 @@ DASHBOARD_TEMPLATE = """
                         legend: { 
                             position: 'top',
                             align: 'end',
-                            labels: { color: '#666', boxWidth: 12, font: { size: 10, weight: 'bold' }, padding: 20 } 
+                            labels: { color: textColor, boxWidth: 12, font: { size: 10, weight: 'bold' }, padding: 20 } 
                         },
                         tooltip: {
-                            backgroundColor: 'rgba(0,0,0,0.85)',
-                            titleColor: '#fff',
-                            bodyColor: '#aaa',
-                            borderColor: '#333',
+                            backgroundColor: isLight ? 'rgba(255,255,255,0.95)' : 'rgba(0,0,0,0.85)',
+                            titleColor: isLight ? '#0f172a' : '#fff',
+                            bodyColor: isLight ? '#475569' : '#aaa',
+                            borderColor: isLight ? '#e2e8f0' : '#333',
                             borderWidth: 1,
                             padding: 12,
                             displayColors: true,
@@ -2566,7 +2789,7 @@ DASHBOARD_TEMPLATE = """
                         x: { 
                             grid: { display: false }, 
                             ticks: { 
-                                color: '#94a3b8', 
+                                color: textColor, 
                                 font: { size: 10, weight: 'bold' },
                                 maxRotation: 0,
                                 autoSkip: true
@@ -2574,11 +2797,11 @@ DASHBOARD_TEMPLATE = """
                         },
                         y: { 
                             beginAtZero: true, 
-                            grid: { color: 'rgba(255, 255, 255, 0.05)', drawBorder: false }, 
+                            grid: { color: gridColor, drawBorder: false }, 
                             ticks: { 
-                                color: 'var(--text-slate-400)', 
+                                color: textColor, 
                                 font: { size: 10, family: 'Inter' },
-                                precision: 0 // Keep integers for counts
+                                precision: 0
                             } 
                         }
                     },
@@ -3170,6 +3393,20 @@ DASHBOARD_TEMPLATE = """
             window.open('/api/violations/export');
         }
         
+        function loadCurrentSettings() {
+            fetch('/api/settings')
+                .then(r => r.json())
+                .then(data => {
+                    if (data.confidence !== undefined) {
+                        document.getElementById('confidence-setting').value = data.confidence;
+                        document.getElementById('confidence-value').textContent = parseFloat(data.confidence).toFixed(2);
+                    }
+                    if (data.cooldown !== undefined) {
+                        document.getElementById('cooldown-setting').value = data.cooldown;
+                    }
+                });
+        }
+
         function saveSettings() {
             const cooldown = document.getElementById('cooldown-setting').value;
             const confidence = document.getElementById('confidence-setting').value;
@@ -3182,7 +3419,15 @@ DASHBOARD_TEMPLATE = """
                 .then(r => r.json())
                 .then(data => {
                     if (data.success) {
-                        alert('Settings saved successfully!');
+                        // Success toast/alert can be added here
+                        const btn = document.querySelector('button[onclick="saveSettings()"]');
+                        const originalText = btn.innerHTML;
+                        btn.innerHTML = '<span>✅</span> Tersimpan!';
+                        btn.style.background = '#10b981';
+                        setTimeout(() => {
+                            btn.innerHTML = originalText;
+                            btn.style.background = '';
+                        }, 2000);
                     }
                 });
         }
@@ -3624,9 +3869,17 @@ def add_camera():
     # Keep camera inactive by default (lighter load). User can start manually.
     return jsonify({'success': True, 'camera_id': camera_id})
 
-@app.route('/api/settings', methods=['POST'])
-def save_settings():
+@app.route('/api/settings', methods=['GET', 'POST'])
+def handle_settings_api():
     global detection_cooldown
+    
+    if request.method == 'GET':
+        return jsonify({
+            'cooldown': detection_cooldown,
+            'confidence': detector.confidence_threshold
+        })
+        
+    # POST
     data = request.get_json() or {}
     cooldown = data.get('cooldown')
     confidence = data.get('confidence')
@@ -3640,7 +3893,7 @@ def save_settings():
     if confidence is not None:
         try:
             detector.confidence_threshold = float(confidence)
-            print(f"🔧 Updated confidence threshold to {detector.confidence_threshold}")
+            print(f"🔧 [API] Updated confidence threshold to {detector.confidence_threshold}")
         except ValueError:
             pass
             
@@ -3999,48 +4252,65 @@ def export_data():
 def get_statistics():
     global global_stats
     
+    start_date = request.args.get('start')
+    end_date = request.args.get('end')
+    
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    # Get active cameras count
+    # Filter builder
+    where_clauses = []
+    params = []
+    if start_date:
+        where_clauses.append("DATE(timestamp) >= ?")
+        params.append(start_date)
+    if end_date:
+        where_clauses.append("DATE(timestamp) <= ?")
+        params.append(end_date)
+    
+    where_str = " WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+    
+    # 1. Total Violations
+    cursor.execute(f"SELECT COUNT(*) FROM violations{where_str}", params)
+    total_violations = cursor.fetchone()[0]
+    
+    # 2. No Helmet
+    helmet_where = " AND ".join(where_clauses + ["violation_type = 'nohelmet'"])
+    cursor.execute(f"SELECT COUNT(*) FROM violations WHERE {helmet_where}" if where_clauses else "SELECT COUNT(*) FROM violations WHERE violation_type = 'nohelmet'", params)
+    no_helmet_count = cursor.fetchone()[0]
+    
+    # 3. No Vest
+    vest_where = " AND ".join(where_clauses + ["violation_type = 'novest'"])
+    cursor.execute(f"SELECT COUNT(*) FROM violations WHERE {vest_where}" if where_clauses else "SELECT COUNT(*) FROM violations WHERE violation_type = 'novest'", params)
+    no_vest_count = cursor.fetchone()[0]
+    
+    # 4. Active Cameras (Always current)
     cursor.execute("SELECT COUNT(*) FROM cameras WHERE status = 'active'")
-    active_cameras_db = cursor.fetchone()[0]
+    active_cameras = cursor.fetchone()[0]
     
-    # --- Ambil Angka Total dari Database (agar sinkron dengan Log) ---
-    cursor.execute("SELECT COUNT(*) FROM violations")
-    total_violations_db = cursor.fetchone()[0]
-    
-    cursor.execute("SELECT COUNT(*) FROM violations WHERE violation_type = 'nohelmet'")
-    no_helmet_count_db = cursor.fetchone()[0]
-    
-    cursor.execute("SELECT COUNT(*) FROM violations WHERE violation_type = 'novest'")
-    no_vest_count_db = cursor.fetchone()[0]
-    
-    # --- Rata-rata Akurasi APD Detection ---
-    cursor.execute('''
-        SELECT AVG(confidence) FROM violations
-        WHERE violation_type IN ('nohelmet', 'novest')
-    ''')
+    # 5. Average APD Accuracy
+    cursor.execute(f"SELECT AVG(confidence) FROM violations{where_str}", params)
     row = cursor.fetchone()
     avg_apd_accuracy = round((row[0] or 0.0) * 100, 1)
     
-    # --- Rata-rata Akurasi Face Recognition ---
+    # 6. Average Face Accuracy
     avg_face_accuracy = 0.0
     try:
-        cursor.execute('SELECT AVG(similarity) FROM face_recognition_log')
+        # Note: face_recognition_log might have different timestamp column or structure
+        cursor.execute(f"SELECT AVG(similarity) FROM face_recognition_log{where_str}", params)
         row_face = cursor.fetchone()
         if row_face and row_face[0] is not None:
             avg_face_accuracy = round(row_face[0] * 100, 1)
     except Exception:
         pass
-    
+        
     conn.close()
     
     return jsonify({
-        'total_violations': total_violations_db,
-        'no_helmet_count': no_helmet_count_db,
-        'no_vest_count': no_vest_count_db,
-        'active_cameras': active_cameras_db,
+        'total_violations': total_violations,
+        'no_helmet_count': no_helmet_count,
+        'no_vest_count': no_vest_count,
+        'active_cameras': active_cameras,
         'avg_apd_accuracy': avg_apd_accuracy,
         'avg_face_accuracy': avg_face_accuracy
     })
@@ -4251,6 +4521,55 @@ def delete_capture(temp_id):
     except Exception as e:
         print(f"❌ [API] Error saat menghapus folder: {str(e)}")
         return jsonify({'success': False, 'message': f'Error sistem: {str(e)}'})
+
+# --- User Management API ---
+@app.route('/api/users', methods=['GET', 'POST'])
+def api_users():
+    if 'role' not in session or session['role'] != 'admin':
+        return jsonify({'success': False, 'message': 'Unauthorized'}), 403
+        
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    if request.method == 'GET':
+        cursor.execute('SELECT username, role, created_at FROM users ORDER BY created_at DESC')
+        users = [{'username': u[0], 'role': u[1], 'created_at': u[2]} for u in cursor.fetchall()]
+        conn.close()
+        return jsonify(users)
+    
+    data = request.json
+    username = data.get('username')
+    password = data.get('password')
+    role = data.get('role', 'petugas')
+    
+    if not username or not password:
+        return jsonify({'success': False, 'message': 'Missing data'}), 400
+        
+    hashed_password = hashlib.sha256(password.encode()).hexdigest()
+    try:
+        cursor.execute('INSERT INTO users (username, password, role) VALUES (?, ?, ?)',
+                     (username, hashed_password, role))
+        conn.commit()
+        return jsonify({'success': True})
+    except sqlite3.IntegrityError:
+        return jsonify({'success': False, 'message': 'Username sudah terdaftar'})
+    finally:
+        conn.close()
+
+@app.route('/api/users/<username>', methods=['DELETE'])
+def delete_user(username):
+    if 'role' not in session or session['role'] != 'admin':
+        return jsonify({'success': False, 'message': 'Unauthorized'}), 403
+        
+    if username == 'admin':
+        return jsonify({'success': False, 'message': 'Cannot delete main admin'}), 400
+        
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM users WHERE username = ?', (username,))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True})
 
 if __name__ == '__main__':
     import socket

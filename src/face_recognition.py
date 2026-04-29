@@ -13,6 +13,10 @@ from pathlib import Path
 from collections import deque, Counter
 import threading
 import urllib.request
+from PIL import Image
+import torch
+from torchvision import transforms
+from facenet_pytorch import InceptionResnetV1
 
 class FaceRecognitionSystem:
     def __init__(self, similarity_threshold=0.520):
@@ -97,24 +101,18 @@ class FaceRecognitionSystem:
             self.dnn_net = None
     # ── Helper: Download Embedder model (CNN) jika belum ada ─────────────────
     def _try_load_embedder(self):
-        """Load OpenFace DNN embedder (CNN). Download jika belum ada."""
-        model_dir = os.path.join(os.path.dirname(__file__), '..', 'models', 'face_recognizer')
-        model_path = os.path.join(model_dir, 'openface_nn4.small2.v1.t7')
-        
-        # Mirror link yang lebih stabil
-        model_url = "https://github.com/pyannote/pyannote-data/raw/master/openface.nn4.small2.v1.t7"
-
+        """Load Official FaceNet (InceptionResnetV1 - 512D)."""
         try:
-            os.makedirs(model_dir, exist_ok=True)
-            if not os.path.exists(model_path):
-                print("[*] Downloading CNN face embedder model (~30 MB)...")
-                urllib.request.urlretrieve(model_url, model_path)
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            print(f"[*] Loading FaceNet 512D (InceptionResnetV1) on {self.device}...")
             
-            self.embedder_net = cv2.dnn.readNetFromTorch(model_path)
-            print("[*] CNN Face Embedder (OpenFace) loaded successfully")
+            # Load pretrained model
+            self.embedder_net = InceptionResnetV1(pretrained='vggface2').eval().to(self.device)
+            print("[*] FaceNet 512D loaded successfully")
         except Exception as e:
-            print(f"[!] Gagal load CNN Embedder ({e}). Sistem akan menggunakan fallback.")
+            print(f"[!] Gagal load FaceNet 512D ({e}). Sistem akan menggunakan fallback.")
             self.embedder_net = None
+            self.device = 'cpu'
     # ─────────────────────────────────────────────────────────────────────────
     
     def detect_faces(self, frame):
@@ -133,49 +131,79 @@ class FaceRecognitionSystem:
 
         # ── Jalur 1: DNN SSD ─────────────────────────────────────────────────
         if self.dnn_net is not None:
-            blob = cv2.dnn.blobFromImage(
-                cv2.resize(frame, (300, 300)), 1.0,
-                (300, 300), (104.0, 177.0, 123.0)
-            )
-            self.dnn_net.setInput(blob)
-            detections = self.dnn_net.forward()
+            try:
+                # Pastikan frame memiliki 3 channel (BGR)
+                if len(frame.shape) == 2:
+                    infer_frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                elif len(frame.shape) == 3 and frame.shape[2] == 4:
+                    infer_frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+                else:
+                    infer_frame = frame
+                
+                # Tidak perlu cv2.resize manual, blobFromImage sudah melakukannya
+                blob = cv2.dnn.blobFromImage(
+                    infer_frame, 1.0,
+                    (300, 300), (104.0, 177.0, 123.0),
+                    swapRB=False, crop=False
+                )
+                self.dnn_net.setInput(blob)
+                detections = self.dnn_net.forward()
 
-            for i in range(detections.shape[2]):
-                confidence = float(detections[0, 0, i, 2])
-                if confidence < 0.50:   # buang deteksi lemah
-                    continue
-                x1 = max(0, int(detections[0, 0, i, 3] * w))
-                y1 = max(0, int(detections[0, 0, i, 4] * h))
-                x2 = min(w, int(detections[0, 0, i, 5] * w))
-                y2 = min(h, int(detections[0, 0, i, 6] * h))
-                if x2 > x1 and y2 > y1:
-                    face_detections.append({'bbox': [x1, y1, x2, y2], 'confidence': confidence})
-            return face_detections
+                for i in range(detections.shape[2]):
+                    confidence = float(detections[0, 0, i, 2])
+                    if confidence < 0.50:   # buang deteksi lemah
+                        continue
+                    x1 = max(0, int(detections[0, 0, i, 3] * w))
+                    y1 = max(0, int(detections[0, 0, i, 4] * h))
+                    x2 = min(w, int(detections[0, 0, i, 5] * w))
+                    y2 = min(h, int(detections[0, 0, i, 6] * h))
+                    if x2 > x1 and y2 > y1:
+                        face_detections.append({'bbox': [x1, y1, x2, y2], 'confidence': confidence})
+                
+                if face_detections:
+                    return face_detections
+                # Jika DNN tidak menemukan apa-apa, biarkan jatuh ke Haar Cascade sebagai fallback
+            except Exception as e:
+                print(f"[!] DNN SSD Error: {e}. Fallback to Haar Cascade.")
+                # Lanjut ke Haar Cascade di bawah ini
 
         # ── Jalur 2: Haar Cascade (fallback) ─────────────────────────────────
-        gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray  = cv2.equalizeHist(gray)   # normalisasi pencahayaan sebelum deteksi
-        faces = self.face_cascade.detectMultiScale(
-            gray,
-            scaleFactor=1.05,   # lebih teliti (dari 1.1)
-            minNeighbors=4,     # sedikit lebih permisif (dari 5)
-            minSize=(40, 40)
-        )
-        for (x, y, fw, fh) in faces:
-            face_detections.append({
-                'bbox': [x, y, x + fw, y + fh],
-                'confidence': 0.90
-            })
+        try:
+            h, w = frame.shape[:2]
+            # Validasi ukuran: Jika frame/roi terlalu kecil, Haar Cascade akan crash.
+            if h < 20 or w < 20:
+                return face_detections
+                
+            gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray  = cv2.equalizeHist(gray)   # normalisasi pencahayaan sebelum deteksi
+            
+            # Gunakan minSize yang proporsional dengan gambar
+            min_s = min(40, int(min(h, w) * 0.2))
+            
+            faces = self.face_cascade.detectMultiScale(
+                gray,
+                scaleFactor=1.1,    # Diubah ke 1.1 agar tidak memicu bug getScaleData di OpenCV
+                minNeighbors=4,     # sedikit lebih permisif (dari 5)
+                minSize=(min_s, min_s)
+            )
+            for (x, y, fw, fh) in faces:
+                face_detections.append({
+                    'bbox': [x, y, x + fw, y + fh],
+                    'confidence': 0.90
+                })
+        except Exception as e:
+            print(f"[!] Haar Cascade Error: {e}")
+            
         return face_detections
     
     def extract_face_features(self, frame, bbox):
         """
-        Extract 128-d face embeddings using CNN (Deep Learning - OpenFace)
+        Extract 512-d face embeddings using FaceNet (InceptionResnetV1)
         """
         if self.embedder_net is None:
-            # Fallback jika DNN gagal (pakai mean pixel sederhana agar tidak crash)
-            print("[!] Warning: CNN Embedder not loaded, using zero-fallback")
-            return np.zeros(128, dtype=np.float32)
+            # Fallback jika DNN gagal
+            print("[!] Warning: FaceNet Embedder not loaded, using zero-fallback")
+            return np.zeros(512, dtype=np.float32)
 
         try:
             h, w = frame.shape[:2]
@@ -184,20 +212,28 @@ class FaceRecognitionSystem:
             # Crop wajah
             face_region = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
             
-            # --- VALIDASI UKURAN: OpenFace butuh ukuran yang cukup (min 48x48) agar pooling tidak crash ---
+            # Validasi Ukuran: FaceNet lebih toleran tapi terlalu kecil bisa jelek kualitasnya
             fh, fw = face_region.shape[:2]
-            if fw < 48 or fh < 48:
+            if fw < 20 or fh < 20:
                 return None
 
-            # Preprocessing: Resize manual dulu dengan INTER_CUBIC agar kualitas terjaga
-            face_resized = cv2.resize(face_region, (96, 96), interpolation=cv2.INTER_CUBIC)
+            # Convert BGR (OpenCV) to RGB (PIL/PyTorch format)
+            face_rgb = cv2.cvtColor(face_region, cv2.COLOR_BGR2RGB)
+            face_pil = Image.fromarray(face_rgb)
             
-            # Preprocessing untuk OpenFace CNN: mean subtraction
-            face_blob = cv2.dnn.blobFromImage(face_resized, 1.0/255, (96, 96), (0, 0, 0), swapRB=True, crop=False)
+            # Preprocessing untuk InceptionResnetV1
+            # Input yang optimal adalah 160x160 dengan normalisasi standar image
+            preprocess = transforms.Compose([
+                transforms.Resize((160, 160)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+            ])
+            
+            face_tensor = preprocess(face_pil).unsqueeze(0).to(self.device)
             
             # Forward pass melalui CNN
-            self.embedder_net.setInput(face_blob)
-            face_encoding = self.embedder_net.forward()
+            with torch.no_grad():
+                face_encoding = self.embedder_net(face_tensor).cpu().numpy()[0]
             
             # Normalisasi L2 untuk Cosine Similarity
             encoding = face_encoding.flatten()
@@ -208,7 +244,7 @@ class FaceRecognitionSystem:
             return encoding
 
         except Exception as e:
-            print(f"[!] Error in CNN feature extraction: {e}")
+            print(f"[!] Error in FaceNet feature extraction: {e}")
             return None
     
     def recognize_face(self, frame, bbox):
@@ -228,18 +264,26 @@ class FaceRecognitionSystem:
         x1, y1, x2, y2 = max(0, x1), max(0, y1), min(x2, w), min(y2, h)
         face_roi = frame[y1:y2, x1:x2]
         
+        tight_bbox = bbox
         if face_roi.size > 0:
             found_faces = self.detect_faces(face_roi)
-            # Cari apakah ada wajah dengan confidence cukup tinggi (0.6)
+            # Cari apakah ada wajah dengan confidence cukup tinggi (0.5)
             # Jika tidak ada wajah nyata, jangan tebak nama (return None)
-            if not found_faces or max([f['confidence'] for f in found_faces]) < 0.6:
+            valid_faces = [f for f in found_faces if f['confidence'] >= 0.5]
+            if not valid_faces:
                 # Return None (Unknown) tapi tetap update last_similarities agar grafik jalan
                 self.last_similarities.append(0.0) 
                 if len(self.last_similarities) > self.max_history_size: self.last_similarities.pop(0)
                 return None, 0.0
+            
+            # Gunakan TIGHT BBOX dari wajah yang terdeteksi (SANGAT PENTING untuk FaceNet)
+            best_face = max(valid_faces, key=lambda f: f['confidence'])
+            fx1, fy1, fx2, fy2 = best_face['bbox']
+            # Convert koordinat lokal face_roi ke koordinat absolut frame
+            tight_bbox = [x1 + fx1, y1 + fy1, x1 + fx2, y1 + fy2]
         
-        # Extract face features (lanjut jika lolos validasi)
-        face_encoding = self.extract_face_features(frame, bbox)
+        # Extract face features menggunakan TIGHT BBOX (bukan kotak badan utuh)
+        face_encoding = self.extract_face_features(frame, tight_bbox)
         
         if face_encoding is None:
             return None, 0.0
