@@ -44,3 +44,8 @@ experiments/*/train/
 experiments/*/valid/
 experiments/*/test/
 *.backup
+
+web_app/*.key
+web_app/*.db
+
+*.onnx

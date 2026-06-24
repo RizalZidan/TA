@@ -8,7 +8,7 @@ echo Menggunakan instalasi Python murni untuk mencegah error!
 echo =======================================================
 echo.
 
-C:\Python312\python.exe web_app\app_advanced.py
+python web_app\app_advanced.py
 
 echo.
 pause

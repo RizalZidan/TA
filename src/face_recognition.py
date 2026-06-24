@@ -131,40 +131,50 @@ class FaceRecognitionSystem:
 
         # ── Jalur 1: DNN SSD ─────────────────────────────────────────────────
         if self.dnn_net is not None:
-            try:
-                # Pastikan frame memiliki 3 channel (BGR)
-                if len(frame.shape) == 2:
-                    infer_frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-                elif len(frame.shape) == 3 and frame.shape[2] == 4:
-                    infer_frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-                else:
-                    infer_frame = frame
-                
-                # Tidak perlu cv2.resize manual, blobFromImage sudah melakukannya
-                blob = cv2.dnn.blobFromImage(
-                    infer_frame, 1.0,
-                    (300, 300), (104.0, 177.0, 123.0),
-                    swapRB=False, crop=False
-                )
-                self.dnn_net.setInput(blob)
-                detections = self.dnn_net.forward()
+            with self.lock:
+                try:
+                    # Pastikan frame memiliki 3 channel (BGR)
+                    if len(frame.shape) == 2:
+                        infer_frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                    elif len(frame.shape) == 3 and frame.shape[2] == 4:
+                        infer_frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+                    else:
+                        infer_frame = frame
+                    
+                    # Tidak perlu cv2.resize manual, blobFromImage sudah melakukannya
+                    blob = cv2.dnn.blobFromImage(
+                        infer_frame, 1.0,
+                        (300, 300), (104.0, 177.0, 123.0),
+                        swapRB=False, crop=False
+                    )
+                    self.dnn_net.setInput(blob)
+                    detections = self.dnn_net.forward()
 
-                for i in range(detections.shape[2]):
-                    confidence = float(detections[0, 0, i, 2])
-                    if confidence < 0.50:   # buang deteksi lemah
-                        continue
-                    x1 = max(0, int(detections[0, 0, i, 3] * w))
-                    y1 = max(0, int(detections[0, 0, i, 4] * h))
-                    x2 = min(w, int(detections[0, 0, i, 5] * w))
-                    y2 = min(h, int(detections[0, 0, i, 6] * h))
-                    if x2 > x1 and y2 > y1:
-                        face_detections.append({'bbox': [x1, y1, x2, y2], 'confidence': confidence})
-                
-                if face_detections:
-                    return face_detections
-                # Jika DNN tidak menemukan apa-apa, biarkan jatuh ke Haar Cascade sebagai fallback
-            except Exception as e:
-                print(f"[!] DNN SSD Error: {e}. Fallback to Haar Cascade.")
+                    for i in range(detections.shape[2]):
+                        confidence = float(detections[0, 0, i, 2])
+                        if confidence < 0.35:   # Turunkan threshold deteksi untuk mengakomodasi FaceNet (terutama CCTV)
+                            continue
+                        x1 = int(detections[0, 0, i, 3] * w)
+                        y1 = int(detections[0, 0, i, 4] * h)
+                        x2 = int(detections[0, 0, i, 5] * w)
+                        y2 = int(detections[0, 0, i, 6] * h)
+                        
+                        # Expand bounding box sedikit agar dahi dan dagu tidak terpotong (FaceNet butuh context)
+                        bw = x2 - x1
+                        bh = y2 - y1
+                        x1 = max(0, x1 - int(bw * 0.1))
+                        y1 = max(0, y1 - int(bh * 0.15))
+                        x2 = min(w, x2 + int(bw * 0.1))
+                        y2 = min(h, y2 + int(bh * 0.1))
+                        
+                        if x2 > x1 and y2 > y1:
+                            face_detections.append({'bbox': [x1, y1, x2, y2], 'confidence': confidence})
+                    
+                    if face_detections:
+                        return face_detections
+                    # Jika DNN tidak menemukan apa-apa, biarkan jatuh ke Haar Cascade sebagai fallback
+                except Exception as e:
+                    print(f"[!] DNN SSD Error: {e}. Fallback to Haar Cascade.")
                 # Lanjut ke Haar Cascade di bawah ini
 
         # ── Jalur 2: Haar Cascade (fallback) ─────────────────────────────────
@@ -177,13 +187,14 @@ class FaceRecognitionSystem:
             gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             gray  = cv2.equalizeHist(gray)   # normalisasi pencahayaan sebelum deteksi
             
-            # Gunakan minSize yang proporsional dengan gambar
-            min_s = min(40, int(min(h, w) * 0.2))
+            # Gunakan minSize yang proporsional tapi tidak boleh terlalu kecil
+            min_s = max(24, int(min(h, w) * 0.2))
             
+            # Gunakan try-except spesifik untuk menghindari crash OpenCV internals
             faces = self.face_cascade.detectMultiScale(
                 gray,
-                scaleFactor=1.1,    # Diubah ke 1.1 agar tidak memicu bug getScaleData di OpenCV
-                minNeighbors=4,     # sedikit lebih permisif (dari 5)
+                scaleFactor=1.2,    # Lebih stabil untuk gambar kecil
+                minNeighbors=5,
                 minSize=(min_s, min_s)
             )
             for (x, y, fw, fh) in faces:
@@ -216,6 +227,19 @@ class FaceRecognitionSystem:
             fh, fw = face_region.shape[:2]
             if fw < 20 or fh < 20:
                 return None
+
+            # --- SOFTWARE ENHANCEMENT: Smart Lighting Correction ---
+            # Cek seberapa gelap wajah tersebut
+            gray_face = cv2.cvtColor(face_region, cv2.COLOR_BGR2GRAY)
+            mean_brightness = np.mean(gray_face)
+            
+            # Jika wajah terlalu gelap (seperti kena Backlight atau ruangan gelap), 
+            # lakukan Gamma Correction untuk menerangkan detail wajah.
+            if mean_brightness < 80:
+                gamma = 1.8 # Nilai gamma > 1 akan menerangkan area gelap
+                inv_gamma = 1.0 / gamma
+                table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
+                face_region = cv2.LUT(face_region, table)
 
             # Convert BGR (OpenCV) to RGB (PIL/PyTorch format)
             face_rgb = cv2.cvtColor(face_region, cv2.COLOR_BGR2RGB)
@@ -267,20 +291,18 @@ class FaceRecognitionSystem:
         tight_bbox = bbox
         if face_roi.size > 0:
             found_faces = self.detect_faces(face_roi)
-            # Cari apakah ada wajah dengan confidence cukup tinggi (0.5)
-            # Jika tidak ada wajah nyata, jangan tebak nama (return None)
-            valid_faces = [f for f in found_faces if f['confidence'] >= 0.5]
-            if not valid_faces:
-                # Return None (Unknown) tapi tetap update last_similarities agar grafik jalan
-                self.last_similarities.append(0.0) 
-                if len(self.last_similarities) > self.max_history_size: self.last_similarities.pop(0)
-                return None, 0.0
+            # Filter wajah dengan confidence
+            valid_faces = [f for f in found_faces if f['confidence'] >= 0.45]
             
-            # Gunakan TIGHT BBOX dari wajah yang terdeteksi (SANGAT PENTING untuk FaceNet)
-            best_face = max(valid_faces, key=lambda f: f['confidence'])
-            fx1, fy1, fx2, fy2 = best_face['bbox']
-            # Convert koordinat lokal face_roi ke koordinat absolut frame
-            tight_bbox = [x1 + fx1, y1 + fy1, x1 + fx2, y1 + fy2]
+            if valid_faces:
+                # Gunakan TIGHT BBOX jika ditemukan (lebih akurat)
+                best_face = max(valid_faces, key=lambda f: f['confidence'])
+                fx1, fy1, fx2, fy2 = best_face['bbox']
+                tight_bbox = [x1 + fx1, y1 + fy1, x1 + fx2, y1 + fy2]
+            else:
+                # FALLBACK: Jika deteksi kedua gagal, tetap gunakan bbox awal 
+                # (mungkin karena cahaya/posisi miring), jangan langsung return None.
+                pass 
         
         # Extract face features menggunakan TIGHT BBOX (bukan kotak badan utuh)
         face_encoding = self.extract_face_features(frame, tight_bbox)
@@ -306,10 +328,11 @@ class FaceRecognitionSystem:
             try:
                 similarities = cosine_similarity(face_encoding, all_stored)[0]
                 worker_max_sim = np.max(similarities)
-            except ValueError:
-                print(f"⚠️ [PENTING] Data wajah {worker_id} tidak kompatibel! HAPUS pekerja ini dan DAFTARKAN ULANG.")
+            except ValueError as ve:
+                print(f"⚠️ [PENTING] Data wajah {worker_id} tidak kompatibel! HAPUS pekerja ini dan DAFTARKAN ULANG. Error: {ve}")
                 worker_max_sim = 0
-            except Exception:
+            except Exception as e:
+                print(f"[!] Error in cosine_similarity for {worker_id}: {e}")
                 worker_max_sim = 0
                 
             overall_best_sim = max(overall_best_sim, worker_max_sim)
@@ -393,7 +416,7 @@ class FaceRecognitionSystem:
                 if len(target_encodings) > 0:
                     try:
                         loc_sim = np.max(cosine_similarity(face_encoding, target_encodings)[0])
-                        if loc_sim >= 0.75:   # Hysteresis: sedikit di bawah threshold masih ok
+                        if loc_sim >= (self.similarity_threshold - 0.06):   # Hysteresis: sedikit di bawah threshold masih ok
                             best_match_id = last_winner
                     except Exception:
                         pass
@@ -580,6 +603,33 @@ class FaceRecognitionSystem:
             print(f"[*] Worker {worker_id} name updated to {new_name}")
             return True
         return False
+        
+    def rename_worker(self, old_id, new_id, new_name):
+        """Rename worker ID and update name while keeping encodings"""
+        if old_id not in self.face_metadata:
+            return False
+            
+        # Jika ID berubah, pindahkan data ke kunci baru
+        if old_id != new_id:
+            # Cegah tabrakan dengan ID yang sudah ada
+            if new_id in self.face_metadata and new_id != old_id:
+                print(f"[!] Gagal rename: ID {new_id} sudah digunakan.")
+                return False
+                
+            # Pindahkan Encodings
+            if old_id in self.face_encodings:
+                self.face_encodings[new_id] = self.face_encodings.pop(old_id)
+            
+            # Pindahkan Metadata
+            self.face_metadata[new_id] = self.face_metadata.pop(old_id)
+            
+        # Update Nama
+        self.face_metadata[new_id]['name'] = new_name
+        
+        # Simpan perubahan
+        self.save_face_database()
+        print(f"[*] Worker {old_id} successfully renamed to {new_id} ({new_name})")
+        return True
     
     def set_similarity_threshold(self, threshold):
         """Set similarity threshold for face recognition"""
