@@ -48,4 +48,3 @@ experiments/*/test/
 web_app/*.key
 web_app/*.db
 
-*.onnx
